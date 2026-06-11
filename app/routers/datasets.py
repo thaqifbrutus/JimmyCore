@@ -9,7 +9,7 @@ router = APIRouter()
 def list_datasets(db: Session = Depends(get_db)):
     datasets = db.query(Dataset).order_by(Dataset.uploaded_at.desc()).all()
 
-    return[{
+    return [{
         "id": str(d.id),
         "original_name": d.original_name,
         "row_count": d.row_count,
