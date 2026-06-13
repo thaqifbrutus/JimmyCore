@@ -5,4 +5,4 @@ load_dotenv()
 
 # Configuration variables
 DATABASE_URL= os.getenv("DATABASE_URL")
-AI_API_KEY = os.getenv("AI_API_KEY")
+AI_API_KEY = os.getenv("GEMINI_AI_API_KEY")
