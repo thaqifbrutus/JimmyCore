@@ -3,7 +3,7 @@ import requests
 import json
 
 # API_BASE = "http://localhost:8000/api"
-API_BASE = "jimmycore-production.up.railway.app"
+API_BASE = "https://jimmycore-production.up.railway.app/api"
 
 st.set_page_config(
     page_title="JimmyCore",
