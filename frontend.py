@@ -15,7 +15,7 @@ st.title("JimmyCore")
 st.caption("AI-powered data quality platform")
 st.divider()
 
-def upload_file(file):
+def upload_csv_to_api(file):
     response = requests.post(
         f"{API_BASE}/upload",
         files={"file": (file.name, file.getvalue(), "text/csv")}
@@ -86,10 +86,10 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file and not st.session_state.dataset_id:
     with st.spinner("Uploading..."):
-        result = upload_file(uploaded_file)
+        result = upload_csv_to_api(uploaded_file)
         if result:
             st.session_state.dataset_id = result["dataset_id"]
-            st.success(f"✅ Uploaded: **{result['original name']}**")
+            st.success(f"✅ Uploaded: **{result['original_name']}**")
         else:
             st.error("Upload failed. Check your API is running.")
 
