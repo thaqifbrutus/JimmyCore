@@ -89,7 +89,7 @@ if uploaded_file and not st.session_state.dataset_id:
         result = upload_file(uploaded_file)
         if result:
             st.session_state.dataset_id = result["dataset_id"]
-            st.success(f"✅ Uploaded: **{result['original_name']}**")
+            st.success(f"✅ Uploaded: **{result['original name']}**")
         else:
             st.error("Upload failed. Check your API is running.")
 
