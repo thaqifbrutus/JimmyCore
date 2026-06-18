@@ -14,7 +14,7 @@ ALLOWED_TYPES = ["text/csv", "application/vnd.ms-excel"]
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 
 # FastAPI endpoint for uploading datasets via UploadFile, File and Depends
-@router.post("/upload")
+@router.post("")
 async def upload_dataset(file: UploadFile = File(...), db: Session = Depends(get_db)):
 
     # Validate file type via HTTPException
@@ -49,7 +49,7 @@ async def upload_dataset(file: UploadFile = File(...), db: Session = Depends(get
     db.commit()
 
     return {"message": f"File '{file.filename}' uploaded successfully.", "dataset_id": str(dataset.id),
-            "original name": dataset.original_name, "status": dataset.status}
+            "original_name": dataset.original_name, "status": dataset.status}
 
     
 # @router.post("/upload")

@@ -8,6 +8,7 @@ from app.services.profiler import profile_dataset, determine_overall_status
 from app.services.ai_service import (generate_dataset_summary, generate_technical_context, answer_dataset_question)
 from pydantic import BaseModel
 import os
+import json
 
 class QuestionRequest(BaseModel):
     question: str
@@ -56,7 +57,7 @@ def trigger_profile(
         report = QualityReport(
             dataset_id=dataset.id,
             profile_data=profile,
-            ai_summary=ai_summary,
+            ai_summary=json.dumps(ai_summary),
             overall_status=overall_status
         )
         db.add(report)
@@ -97,7 +98,7 @@ def trigger_profile(
 
         raise HTTPException(status_code=500, detail=f"Profiling failed: {str(e)}")
     
-@router.get("/reports/{report_id}")
+@router.get("/{report_id}")
 def get_report(report_id: str, db: Session = Depends(get_db)):
     report = db.query(QualityReport).filter(QualityReport.id == report_id).first()
 
@@ -114,7 +115,7 @@ def get_report(report_id: str, db: Session = Depends(get_db)):
     }
     
 
-@router.post("/reports/{report_id}/technical-context")
+@router.post("/{report_id}/technical-context")
 def get_technical_context(
     report_id: str,
     db: Session = Depends(get_db)
@@ -145,7 +146,7 @@ def get_technical_context(
         "technical_brief": technical_brief
     }
 
-@router.post("/reports/{report_id}/ask")
+@router.post("/{report_id}/ask")
 def ask_about_dataset(
     report_id: str,
     request: QuestionRequest,
