@@ -3,6 +3,21 @@ import numpy as np
 from datetime import datetime
 
 
+# Threshold for truncating individual string values inside top_values output.
+# Long narrative text dumped wholesale into the AI prompt's JSON payload was
+# the root cause of the repetition/looping bug — capping length here keeps
+# the profile output bounded regardless of what's in the source data.
+TOP_VALUE_MAX_LENGTH = 80
+
+# A column is considered "high-cardinality" for sampling-skip purposes when
+# its unique-value count is at or above this fraction of total row count.
+HIGH_CARDINALITY_RATIO = 0.95
+
+# A column is considered "long-form text" for sampling-skip purposes when
+# its average string length (from _get_string_patterns) is at or above this.
+LONG_FORM_TEXT_AVG_LENGTH = 50
+
+
 def profile_dataset(file_path: str) -> dict:
     """
     Reads a CSV file and returns a comprehensive profile of its contents.
@@ -48,27 +63,73 @@ def _get_column_profiles(df: pd.DataFrame) -> list:
         series = df[col]
         null_count = int(series.isnull().sum())
         total = len(series)
+        unique_count = int(series.nunique())
 
         col_profile = {
             "name": col,
             "dtype": str(series.dtype),
             "null_count": null_count,
             "null_percentage": round((null_count / total) * 100, 2) if total > 0 else 0,
-            "unique_count": int(series.nunique()),
-            "top_values": _get_top_values(series)
+            "unique_count": unique_count,
         }
 
         # Numeric columns get extra statistical analysis
         if pd.api.types.is_numeric_dtype(series):
             col_profile["stats"] = _get_numeric_stats(series)
+            col_profile["top_values"] = _get_top_values(series)
 
-        # String columns get pattern analysis
+        # String columns get pattern analysis. Pattern analysis is computed
+        # first because the resulting avg_length feeds the high-cardinality
+        # long-text check that decides whether top_values sampling runs at
+        # all for this column.
         elif pd.api.types.is_string_dtype(series) or pd.api.types.is_object_dtype(series):
-            col_profile["patterns"] = _get_string_patterns(series)
+            patterns = _get_string_patterns(series)
+            col_profile["patterns"] = patterns
+
+            if _should_skip_value_sampling(series, unique_count, total, patterns):
+                col_profile["top_values"] = []
+                col_profile["sampling_note"] = (
+                    "high cardinality, long-form text — value sampling skipped"
+                )
+            else:
+                col_profile["top_values"] = _get_top_values(series)
+
+        else:
+            col_profile["top_values"] = _get_top_values(series)
 
         column_profiles.append(col_profile)
 
     return column_profiles
+
+
+def _should_skip_value_sampling(series: pd.Series, unique_count: int, total: int, patterns: dict) -> bool:
+    """
+    Decides whether "top values" sampling is meaningless for this column.
+
+    A column qualifies when it is both:
+    1. High-cardinality: nearly every value is unique (close to or equal to
+       total row count), so there's no real repetition to report.
+    2. Long-form text: the average string length (already computed by
+       _get_string_patterns) is long enough that dumping raw values into a
+       prompt risks bloating the payload with narrative text.
+
+    Reuses fields already computed elsewhere in the profiler — no new
+    statistical machinery, per the scope of this fix.
+    """
+    if total == 0:
+        return False
+
+    if not patterns:
+        return False
+
+    avg_length = patterns.get("avg_length")
+    if avg_length is None:
+        return False
+
+    is_high_cardinality = (unique_count / total) >= HIGH_CARDINALITY_RATIO
+    is_long_form = avg_length >= LONG_FORM_TEXT_AVG_LENGTH
+
+    return is_high_cardinality and is_long_form
 
 
 def _get_numeric_stats(series: pd.Series) -> dict:
@@ -119,13 +180,28 @@ def _get_top_values(series: pd.Series, n: int = 5) -> list:
     """
     Returns the most frequently occurring values in a column.
     Useful for spotting dominant categories or suspicious repetition.
+
+    Individual values are truncated to TOP_VALUE_MAX_LENGTH characters
+    before being included — long narrative text values were previously
+    dumped wholesale into the AI prompt's JSON payload, which is what
+    triggered the repetition loop in the AI layer.
     """
     top = series.value_counts().head(n)
 
     return [
-        {"value": str(val), "count": int(count)}
+        {"value": _truncate_value(str(val)), "count": int(count)}
         for val, count in top.items()
     ]
+
+
+def _truncate_value(value: str, max_length: int = TOP_VALUE_MAX_LENGTH) -> str:
+    """
+    Truncates a string value to max_length characters, appending a marker
+    so it's clear in the output that truncation occurred.
+    """
+    if len(value) <= max_length:
+        return value
+    return value[:max_length] + "...(truncated)"
 
 
 def _get_issues(df: pd.DataFrame) -> list:
