@@ -5,7 +5,7 @@ from app.models.dataset import Dataset
 from app.models.report import QualityReport
 router = APIRouter()
 
-@router.get("") ###########
+@router.get("") 
 def list_datasets(db: Session = Depends(get_db)):
     datasets = db.query(Dataset).order_by(Dataset.uploaded_at.desc()).all()
 
@@ -42,7 +42,3 @@ def get_dataset(dataset_id: str, db: Session = Depends(get_db)):
                           "created_at": report.created_at.isoformat()
                           } if report else None
     }
-
-#@router.get("/datasets")
-#def get_datasets():
-    #return {"datasets": []}

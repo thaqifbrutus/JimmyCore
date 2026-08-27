@@ -50,8 +50,3 @@ async def upload_dataset(file: UploadFile = File(...), db: Session = Depends(get
 
     return {"message": f"File '{file.filename}' uploaded successfully.", "dataset_id": str(dataset.id),
             "original_name": dataset.original_name, "status": dataset.status}
-
-    
-# @router.post("/upload")
-# def upload_file():
-#     return {"message": "File uploaded"}
