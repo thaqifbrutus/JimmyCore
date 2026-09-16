@@ -1,6 +1,6 @@
 
 from fastapi import FastAPI
-from app.routers import upload, datasets, reports
+from app.routers import upload, datasets, reports, catalog
 from db.database import init_db
 
 app = FastAPI(title="AI Data Processing Platform",
@@ -15,6 +15,7 @@ def on_startup():
 app.include_router(upload.router, prefix="/upload", tags=["Upload"])
 app.include_router(datasets.router, prefix="/datasets", tags=["Datasets"])
 app.include_router(reports.router, prefix="/reports", tags=["Reports"])
+app.include_router(catalog.router, prefix ="/catalog", tags=["Catalog"]) 
 
 @app.get("/")
 def read_root():
