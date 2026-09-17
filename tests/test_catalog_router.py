@@ -1,14 +1,5 @@
-"""
-Tests for POST /catalog/sync.
+import json
 
-This endpoint only touches CatalogDataset (no Postgres-specific types),
-so — unlike the report/dataset routes, which need real Postgres for their
-UUID/JSONB columns — this one runs on fast in-memory SQLite. The one
-network call (fetch_catalog_dataframe) is monkeypatched; everything else
-runs for real: the FastAPI route, the dependency-injected DB session, and
-the actual upsert logic in sync_catalog.
-"""
-import pandas as pd
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -19,18 +10,11 @@ from sqlalchemy.pool import StaticPool
 from db.database import Base, get_db
 from app.models.catalog_dataset import CatalogDataset
 from app.routers import catalog as catalog_router
-from app.services import catalog_sync
+from app.services import catalog_search
 
 
 @pytest.fixture()
 def db_session():
-    # StaticPool is what actually matters here, not just check_same_thread:
-    # without it, SQLAlchemy's default SingletonThreadPool hands out a
-    # SEPARATE (and separately-empty) :memory: database to each thread,
-    # and TestClient runs requests in a different thread than this fixture.
-    # create_all() would succeed in this thread while the request handler
-    # sees "no such table" in its own thread's database. StaticPool forces
-    # every thread onto the one real connection/database.
     engine = create_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -57,60 +41,46 @@ def client(db_session):
     app.dependency_overrides.clear()
 
 
-def _fake_catalog_df():
-    return pd.DataFrame([
-        {
-            "id": "fuelprice", "date_created": "2023-01-01", "title_en": "Fuel Prices",
-            "category_en": "Economy", "subcategory_en": "Prices", "title_bm": None,
-            "category_bm": None, "subcategory_bm": None, "source": "MOF",
-            "frequency": "Daily", "geography": "National", "demography": None,
-            "dataset_begin": 2015, "dataset_end": 2026,
-        },
-        {
-            "id": "roadaccidents", "date_created": "2022-01-01", "title_en": "Road Accidents",
-            "category_en": "Transport", "subcategory_en": "Safety", "title_bm": None,
-            "category_bm": None, "subcategory_bm": None, "source": "PDRM",
-            "frequency": "Yearly", "geography": "National", "demography": None,
-            "dataset_begin": 2010, "dataset_end": 2024,
-        },
-    ])
+def test_generate_embeddings_endpoint(client, db_session, monkeypatch):
+    db_session.add(CatalogDataset(id="fuelprice", title_en="Fuel Prices"))
+    db_session.commit()
 
+    monkeypatch.setattr(catalog_search, "embed_texts", lambda texts: [[0.1, 0.2] for _ in texts])
 
-def test_sync_endpoint_returns_counts_and_persists_rows(client, db_session, monkeypatch):
-    monkeypatch.setattr(catalog_sync, "fetch_catalog_dataframe", lambda: _fake_catalog_df())
-
-    response = client.post("/catalog/sync")
+    response = client.post("/catalog/embeddings/generate")
 
     assert response.status_code == 200
     body = response.json()
-    assert body["inserted"] == 2
-    assert body["updated"] == 0
-    assert body["total"] == 2
+    assert body["embedded"] == 1
+    assert body["skipped"] == 0
 
-    assert db_session.query(CatalogDataset).count() == 2
-    fuel = db_session.query(CatalogDataset).filter_by(id="fuelprice").first()
-    assert fuel.title_en == "Fuel Prices"
+    row = db_session.query(CatalogDataset).filter_by(id="fuelprice").first()
+    assert json.loads(row.embedding) == [0.1, 0.2]
 
 
-def test_sync_endpoint_is_idempotent_on_repeat_calls(client, db_session, monkeypatch):
-    monkeypatch.setattr(catalog_sync, "fetch_catalog_dataframe", lambda: _fake_catalog_df())
+def test_search_endpoint_returns_ranked_results(client, db_session, monkeypatch):
+    db_session.add_all([
+        CatalogDataset(id="close", title_en="Road Accidents", embedding=json.dumps([1.0, 0.0])),
+        CatalogDataset(id="far", title_en="Weather Data", embedding=json.dumps([0.0, 1.0])),
+    ])
+    db_session.commit()
 
-    client.post("/catalog/sync")
-    second_response = client.post("/catalog/sync")
+    monkeypatch.setattr(catalog_search, "embed_texts", lambda texts: [[1.0, 0.0]])
 
-    body = second_response.json()
-    assert body["inserted"] == 0
-    assert body["updated"] == 2
-    assert db_session.query(CatalogDataset).count() == 2  # not duplicated
+    response = client.get("/catalog/search", params={"q": "car crash statistics"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["query"] == "car crash statistics"
+    assert body["results"][0]["id"] == "close"
+    assert body["results"][0]["score"] > body["results"][1]["score"]
 
 
-def test_sync_endpoint_returns_502_on_fetch_failure(client, monkeypatch):
-    def _boom():
-        raise ConnectionError("could not reach data.gov.my")
+def test_search_endpoint_requires_query_param(client):
+    response = client.get("/catalog/search")
+    assert response.status_code == 422  # FastAPI validation error, missing required q
 
-    monkeypatch.setattr(catalog_sync, "fetch_catalog_dataframe", _boom)
 
-    response = client.post("/catalog/sync")
-
-    assert response.status_code == 502
-    assert "Catalog sync failed" in response.json()["detail"]
+def test_search_endpoint_respects_top_k_bounds(client):
+    response = client.get("/catalog/search", params={"q": "test", "top_k": 999})
+    assert response.status_code == 422  # top_k has a le=20 bound

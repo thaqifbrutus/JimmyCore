@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, Integer
+from sqlalchemy import Column, String, DateTime, Integer, Text
 from db.database import Base
 
 
@@ -33,6 +33,14 @@ class CatalogDataset(Base):
     dataset_end = Column(Integer, nullable=True)
 
     # Ours, not theirs — when our local copy of this row was last refreshed
-    # from the official parquet file. Lets us answer "how stale is our
-    # index" without needing a separate sync-run log table for the MVP.
+    # from the official parquet file.
     last_synced_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # JSON-serialized float array (same Text+json.dumps pattern as
+    # QualityReport.ai_summary). No pgvector needed at this catalog's
+    # scale (hundreds of rows, not millions) — search does a brute-force
+    # in-memory cosine similarity pass instead. NULL until
+    # generate_catalog_embeddings() has processed this row (a fresh sync
+    # can add new rows with no embedding yet, so search must be able to
+    # skip rows that aren't embedded rather than assume every row has one).
+    embedding = Column(Text, nullable=True)
