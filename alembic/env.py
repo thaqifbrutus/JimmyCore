@@ -10,7 +10,7 @@ from db.database import Base
 # tables — SQLAlchemy only registers a model with Base once its module has
 # been imported somewhere. Missing one of these silently drops that table
 # from autogenerate's view of "the real schema."
-from app.models import dataset, report, catalog_dataset, audit_log  # noqa: F401
+from app.models import dataset, report, catalog_dataset, audit_log, gov_data_cache  # noqa: F401
 
 config = context.config
 

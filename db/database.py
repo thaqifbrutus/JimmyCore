@@ -16,5 +16,5 @@ def get_db():
         db.close()
 
 def init_db():
-    from app.models import dataset, report, audit_log, catalog_dataset
+    from app.models import dataset, report, audit_log, catalog_dataset, gov_data_cache
     Base.metadata.create_all(bind=engine)      
