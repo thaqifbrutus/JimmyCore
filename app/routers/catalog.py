@@ -6,7 +6,7 @@ from app.services.catalog_sync import sync_catalog
 from app.services.catalog_search import generate_catalog_embeddings, search_catalog
 from app.services.gov_data_client import get_dataset_dataframe, GovAPIError
 from app.services.profiler import profile_dataframe
-from app.services.ai_service import generate_dataset_summary
+from app.services.ai_service import generate_dataset_summary, build_source_context
 from app.services.report_builder import persist_report
 
 router = APIRouter()
@@ -72,12 +72,16 @@ def analyze_catalog_dataset(
     db: Session = Depends(get_db),
 ):
     """
-    The endpoint that actually closes the loop: given a dataset id (found
-    via /catalog/search), fetches its real data (cached or live, see
-    gov_data_client.py), profiles it, generates an AI summary, and
-    persists a QualityReport — the same report shape as the upload flow,
-    so every existing /reports/{id}, /reports/{id}/technical-context, and
-    /reports/{id}/ask endpoint works on the result with no changes.
+    Given a dataset id (found via /catalog/search), fetches its real data
+    (cached or live), profiles it, generates an AI summary, and persists
+    a QualityReport — the same shape as the upload flow, so every
+    existing /reports/{id} endpoint works on the result unchanged.
+
+    The profile's "source" field (see build_source_context in
+    ai_service.py) tells the model this is an official government dataset
+    rather than a user upload, so it cites the source agency and sticks to
+    summarizing rather than interpreting — see SYSTEM_PROMPT for why that
+    distinction matters here specifically.
     """
     catalog_dataset = db.query(CatalogDataset).filter(CatalogDataset.id == catalog_dataset_id).first()
     if not catalog_dataset:
@@ -96,6 +100,7 @@ def analyze_catalog_dataset(
 
     try:
         profile = profile_dataframe(df)
+        profile["source"] = build_source_context(catalog_dataset)
 
         ai_summary = generate_dataset_summary(
             profile_data=profile,
