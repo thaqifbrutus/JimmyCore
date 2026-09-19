@@ -12,11 +12,11 @@ st.set_page_config(
 )
 
 st.title("JimmyCore")
-st.caption("AI-powered data quality platform")
+st.caption("Search official government datasets, or upload your own CSV — AI-summarized either way")
 st.divider()
 
 
-# ── API helpers ────────────────────────────────────────────────────────────────
+# ── API helpers — upload flow (existing) ────────────────────────────────────
 
 def upload_file(file):
     response = requests.post(
@@ -29,6 +29,45 @@ def upload_file(file):
 def trigger_profile(dataset_id):
     response = requests.post(f"{API_BASE}/reports/datasets/{dataset_id}/profile")
     return response.json() if response.status_code == 200 else None
+
+
+# ── API helpers — government catalog search flow (new) ─────────────────────
+
+def search_catalog(query, top_k=5):
+    """
+    Returns (results, error_message) — one is always None. Distinguishing
+    a genuine search failure from "search worked, zero matches" so the UI
+    can show the right message for each rather than treating both as
+    silent nothing.
+    """
+    try:
+        response = requests.get(
+            f"{API_BASE}/catalog/search",
+            params={"q": query, "top_k": top_k},
+        )
+    except requests.exceptions.RequestException as e:
+        return None, f"Could not reach the API: {e}"
+
+    if response.status_code != 200:
+        detail = response.json().get("detail", response.text) if response.headers.get("content-type", "").startswith("application/json") else response.text
+        return None, detail
+
+    return response.json().get("results", []), None
+
+
+def analyze_catalog_dataset(catalog_dataset_id, force_refresh=False):
+    response = requests.post(
+        f"{API_BASE}/catalog/{catalog_dataset_id}/analyze",
+        params={"force_refresh": force_refresh},
+    )
+    if response.status_code == 200:
+        return response.json(), None
+
+    try:
+        detail = response.json().get("detail", response.text)
+    except ValueError:
+        detail = response.text
+    return None, detail
 
 
 def get_technical_context(report_id):
@@ -110,7 +149,6 @@ def render_technical_brief(content: dict):
     Each section maps to its own visual treatment.
     """
 
-    # Estimated effort — lead with it since it's the executive summary
     effort = content.get("estimated_effort", {})
     level = effort.get("level", "—")
     justification = effort.get("justification", "—")
@@ -122,7 +160,6 @@ def render_technical_brief(content: dict):
 
     st.markdown("---")
 
-    # Suggested schema
     schema = content.get("suggested_schema", [])
     if schema:
         st.markdown("##### 🗂️ Suggested database schema")
@@ -137,7 +174,6 @@ def render_technical_brief(content: dict):
         ]
         st.dataframe(schema_rows, use_container_width=True, hide_index=True)
 
-    # Validation rules
     rules = content.get("validation_rules", [])
     if rules:
         st.markdown("##### ✅ Validation rules")
@@ -150,7 +186,6 @@ def render_technical_brief(content: dict):
         ]
         st.dataframe(rules_rows, use_container_width=True, hide_index=True)
 
-    # Transformation steps
     steps = content.get("transformation_steps", [])
     if steps:
         st.markdown("##### 🔄 Transformation steps")
@@ -163,7 +198,6 @@ def render_technical_brief(content: dict):
         ]
         st.dataframe(steps_rows, use_container_width=True, hide_index=True)
 
-    # Risks and warnings — prose list, not tabular
     risks = content.get("risks_and_warnings", [])
     if risks:
         st.markdown("##### ⚠️ Risks and warnings")
@@ -173,6 +207,8 @@ def render_technical_brief(content: dict):
 
 # ── Session state initialisation ───────────────────────────────────────────────
 
+if "input_mode" not in st.session_state:
+    st.session_state.input_mode = "Search government data"
 if "dataset_id" not in st.session_state:
     st.session_state.dataset_id = None
 if "report_id" not in st.session_state:
@@ -185,42 +221,124 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "search_results" not in st.session_state:
+    st.session_state.search_results = None
+if "search_error" not in st.session_state:
+    st.session_state.search_error = None
+if "source_label" not in st.session_state:
+    st.session_state.source_label = None  # what Step 2's header calls the source
 
 
-# ── Step 1: Upload ─────────────────────────────────────────────────────────────
+def _reset_all():
+    for key in ["dataset_id", "report_id", "profile_result", "tech_brief",
+                "search_results", "search_error", "source_label"]:
+        st.session_state[key] = None
+    st.session_state.chat_history = []
+    st.session_state.messages = []
 
-st.subheader("Step 1 — Upload your dataset")
 
-uploaded_file = st.file_uploader(
-    "Choose a CSV file",
-    type=["csv"],
-    help="Upload any CSV file up to 10MB"
+# ── Step 1: choose input method ─────────────────────────────────────────────
+
+st.subheader("Step 1 — Find a dataset")
+
+st.session_state.input_mode = st.radio(
+    "How do you want to start?",
+    ["Search government data", "Upload a CSV"],
+    horizontal=True,
+    label_visibility="collapsed",
 )
 
-if uploaded_file and not st.session_state.dataset_id:
-    with st.spinner("Uploading..."):
-        result = upload_file(uploaded_file)
-        if result:
-            st.session_state.dataset_id = result["dataset_id"]
-            st.success(f"✅ Uploaded: **{result['original_name']}**")
-        else:
-            st.error("Upload failed. Check your API is running.")
+if st.session_state.input_mode == "Search government data" and not st.session_state.profile_result:
+    st.caption("Search official Malaysian government open data (data.gov.my) by topic")
 
-if st.session_state.dataset_id and not st.session_state.profile_result:
-    if st.button("🔍 Run AI Analysis", type="primary"):
-        with st.spinner("Profiling dataset and generating AI summary — this may take a moment"):
-            result = trigger_profile(st.session_state.dataset_id)
+    search_col, button_col = st.columns([5, 1])
+    with search_col:
+        query = st.text_input(
+            "Search query",
+            placeholder="e.g. drunk driving accidents, fuel prices, unemployment rate",
+            label_visibility="collapsed",
+        )
+    with button_col:
+        run_search = st.button("🔍 Search", type="primary", use_container_width=True)
+
+    if run_search and query.strip():
+        with st.spinner("Searching official datasets..."):
+            results, error = search_catalog(query.strip())
+            st.session_state.search_results = results
+            st.session_state.search_error = error
+
+    if st.session_state.search_error:
+        st.error(f"Search failed: {st.session_state.search_error}")
+
+    elif st.session_state.search_results is not None:
+        if len(st.session_state.search_results) == 0:
+            st.info("No matching datasets found — try a broader or different search term.")
+        else:
+            st.markdown(f"**Found {len(st.session_state.search_results)} matching datasets:**")
+            for result in st.session_state.search_results:
+                with st.container(border=True):
+                    c1, c2 = st.columns([5, 1])
+                    with c1:
+                        st.markdown(f"**{result['title_en']}**")
+                        meta_bits = [
+                            b for b in [
+                                result.get("category_en"),
+                                result.get("subcategory_en"),
+                                result.get("source"),
+                            ] if b
+                        ]
+                        if meta_bits:
+                            st.caption(" · ".join(meta_bits))
+                        if result.get("dataset_begin") and result.get("dataset_end"):
+                            st.caption(f"Coverage: {result['dataset_begin']}–{result['dataset_end']}")
+                        st.caption(f"Match relevance: {result['score']:.0%}")
+                    with c2:
+                        if st.button("Analyze", key=f"analyze_{result['id']}", use_container_width=True):
+                            with st.spinner(f"Fetching and analyzing \"{result['title_en']}\"..."):
+                                analysis, error = analyze_catalog_dataset(result["id"])
+                                if analysis:
+                                    st.session_state.profile_result = analysis
+                                    st.session_state.report_id = analysis["report_id"]
+                                    st.session_state.source_label = result["title_en"]
+                                    st.rerun()
+                                else:
+                                    st.error(f"Analysis failed: {error}")
+
+elif st.session_state.input_mode == "Upload a CSV" and not st.session_state.profile_result:
+    uploaded_file = st.file_uploader(
+        "Choose a CSV file",
+        type=["csv"],
+        help="Upload any CSV file up to 10MB"
+    )
+
+    if uploaded_file and not st.session_state.dataset_id:
+        with st.spinner("Uploading..."):
+            result = upload_file(uploaded_file)
             if result:
-                st.session_state.profile_result = result
-                st.session_state.report_id = result["report_id"]
-                st.rerun()
+                st.session_state.dataset_id = result["dataset_id"]
+                st.success(f"✅ Uploaded: **{result['original_name']}**")
             else:
-                st.error("Profiling failed. Check your API logs.")
+                st.error("Upload failed. Check your API is running.")
+
+    if st.session_state.dataset_id and not st.session_state.profile_result:
+        if st.button("🔍 Run AI Analysis", type="primary"):
+            with st.spinner("Profiling dataset and generating AI summary — this may take a moment"):
+                result = trigger_profile(st.session_state.dataset_id)
+                if result:
+                    st.session_state.profile_result = result
+                    st.session_state.report_id = result["report_id"]
+                    st.session_state.source_label = None  # upload flow shows the filename separately
+                    st.rerun()
+                else:
+                    st.error("Profiling failed. Check your API logs.")
 
 st.divider()
 
 
 # ── Step 2: Results ────────────────────────────────────────────────────────────
+# Shared by both flows — /reports/datasets/{id}/profile (upload) and
+# /catalog/{id}/analyze (search) return the same shape, so everything below
+# renders identically regardless of where the data came from.
 
 if st.session_state.profile_result:
     result = st.session_state.profile_result
@@ -230,8 +348,9 @@ if st.session_state.profile_result:
     emoji, label, alert_type = render_overall_status(status)
 
     st.subheader("Step 2 — Quality report")
+    if st.session_state.source_label:
+        st.caption(f"Source: {st.session_state.source_label} (official government dataset)")
 
-    # Overall status banner
     if alert_type == "success":
         st.success(f"{emoji} Overall status: **{label}**")
     elif alert_type == "warning":
@@ -239,14 +358,12 @@ if st.session_state.profile_result:
     else:
         st.error(f"{emoji} Overall status: **{label}**")
 
-    # Overview metrics
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Rows", f"{overview['row_count']:,}")
     col2.metric("Columns", overview["column_count"])
     col3.metric("Nulls", f"{overview['null_percentage']}%")
     col4.metric("Duplicates", overview["duplicate_row_count"])
 
-    # ── AI Summary ─────────────────────────────────────────────────────────────
     st.markdown("#### 🤖 AI Summary")
     with st.container(border=True):
         ai_summary_raw = result.get("ai_summary")
@@ -259,7 +376,6 @@ if st.session_state.profile_result:
         else:
             st.info("No AI summary available for this report.")
 
-    # ── Issues breakdown ───────────────────────────────────────────────────────
     if issues:
         st.markdown("#### ⚠️ Issues detected")
         for issue in issues:
@@ -271,7 +387,6 @@ if st.session_state.profile_result:
     else:
         st.success("No issues detected. This dataset looks clean!")
 
-    # ── Column breakdown ───────────────────────────────────────────────────────
     if "profile_data" in result:
         st.markdown("#### 📊 Column breakdown")
         columns = result["profile_data"].get("columns", [])
@@ -299,11 +414,8 @@ if st.session_state.profile_result:
                 if col.get("sampling_note"):
                     st.caption(f"ℹ️ {col['sampling_note']}")
 
-    # ── Technical brief ────────────────────────────────────────────────────────
     st.markdown("#### 🛠️ Technical brief for developers")
 
-    # Cache the result in session state so regenerating doesn't clear it
-    # on every Streamlit rerun.
     if st.session_state.tech_brief is None:
         if st.button("Generate technical brief"):
             with st.spinner("Generating technical brief..."):
@@ -332,7 +444,6 @@ if st.session_state.profile_result:
 
     st.divider()
 
-    # ── Step 3: Chat ───────────────────────────────────────────────────────────
     st.subheader("Step 3 — Ask JimmyCore AI")
     st.caption("Ask any question about your dataset in plain English")
 
@@ -353,11 +464,6 @@ if st.session_state.profile_result:
                     st.session_state.chat_history
                 )
 
-                # The /ask endpoint wraps answer_dataset_question's result
-                # dict under an "answer" key. Extract content from that.
-                # NOTE: if your FastAPI /ask endpoint returns the result dict
-                # directly (not nested under "answer"), change this to:
-                #   answer_raw = response
                 answer_raw = response.get("answer") if response else None
                 answer_content, answer_error = extract_ai_content(answer_raw)
 
@@ -381,18 +487,16 @@ if st.session_state.profile_result:
                     st.error("Could not get a response. Check your API.")
 
 else:
-    st.info("Upload a CSV file above to get started.")
+    if st.session_state.input_mode == "Search government data":
+        st.info("Search for a topic above to find official government datasets.")
+    else:
+        st.info("Upload a CSV file above to get started.")
 
 
 # ── Reset button ───────────────────────────────────────────────────────────────
 
-if st.session_state.dataset_id:
+if st.session_state.dataset_id or st.session_state.profile_result:
     st.divider()
-    if st.button("🔄 Analyse a new dataset"):
-        for key in ["dataset_id", "report_id", "profile_result",
-                    "tech_brief", "chat_history", "messages"]:
-            if key in ["chat_history", "messages"]:
-                st.session_state[key] = []
-            else:
-                st.session_state[key] = None
+    if st.button("🔄 Start over"):
+        _reset_all()
         st.rerun()
