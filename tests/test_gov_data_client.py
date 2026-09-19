@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import sessionmaker
 
 from db.database import Base
@@ -30,14 +31,21 @@ from app.services.gov_data_client import RateLimiter, GovAPIError, get_dataset_d
 
 @pytest.fixture()
 def db_session():
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(bind=engine)
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+
+    CatalogDataset.__table__.create(bind=engine, checkfirst=True)
+    GovDataCache.__table__.create(bind=engine, checkfirst=True)
+
     SessionLocal = sessionmaker(bind=engine)
     session = SessionLocal()
     session.add_all([
-    CatalogDataset(id="fuelprice", title_en="Fuel Prices"),
-    CatalogDataset(id="empty_dataset", title_en="Empty Dataset"),
-])
+        CatalogDataset(id="fuelprice", title_en="Fuel Prices"),
+        CatalogDataset(id="empty_dataset", title_en="Empty Dataset"),
+    ])
     session.commit()
     yield session
     session.close()

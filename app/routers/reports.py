@@ -3,8 +3,10 @@ from sqlalchemy.orm import Session
 from db.database import get_db
 from app.models.dataset import Dataset
 from app.models.report import QualityReport
+from app.models.catalog_dataset import CatalogDataset
 from app.models.audit_log import AuditLog
-from app.services.profiler import profile_dataset, determine_overall_status
+from app.services.profiler import profile_dataset
+from app.services.report_builder import persist_report
 from app.services.ai_service import (
     generate_dataset_summary,
     generate_technical_context,
@@ -23,6 +25,42 @@ class QuestionRequest(BaseModel):
 router = APIRouter()
 
 UPLOAD_DIR = "file_uploads"
+
+
+def _resolve_source_name(dataset: Dataset | None, catalog_dataset: CatalogDataset | None) -> str:
+    """
+    A report's "original filename" for AI-prompt purposes now has two
+    possible sources — an uploaded file's original_name, or a government
+    catalog dataset's title_en — since QualityReport is shared across both
+    flows (see app/models/report.py's docstring). Pure function, no DB
+    access, so it's directly unit-testable without a database at all.
+    """
+    if dataset is not None:
+        return dataset.original_name
+    if catalog_dataset is not None:
+        return catalog_dataset.title_en
+    raise ValueError(
+        "Report has neither an uploaded dataset nor a catalog dataset — "
+        "this should be impossible given the ck_report_exactly_one_source "
+        "constraint, so something is badly wrong if this is ever raised."
+    )
+
+
+def _get_report_source(report: QualityReport, db: Session) -> tuple[Dataset | None, CatalogDataset | None]:
+    """
+    Looks up whichever source this report actually has, based on which of
+    dataset_id / catalog_dataset_id is set. Exactly one will be, per the
+    DB-level CHECK constraint.
+    """
+    dataset = None
+    catalog_dataset = None
+
+    if report.dataset_id is not None:
+        dataset = db.query(Dataset).filter(Dataset.id == report.dataset_id).first()
+    elif report.catalog_dataset_id is not None:
+        catalog_dataset = db.query(CatalogDataset).filter(CatalogDataset.id == report.catalog_dataset_id).first()
+
+    return dataset, catalog_dataset
 
 
 @router.post("/datasets/{dataset_id}/profile")
@@ -44,9 +82,6 @@ def trigger_profile(
     try:
         profile = profile_dataset(file_path)
 
-        # ai_summary is now a structured result dict:
-        # {"status": "ok"|"failed", "reason": ..., "content": ...}
-        # Store it as JSON so get_report can return it with the same shape.
         ai_summary = generate_dataset_summary(
             profile_data=profile,
             original_filename=dataset.original_name
@@ -55,43 +90,23 @@ def trigger_profile(
         dataset.row_count = profile["overview"]["row_count"]
         dataset.column_count = profile["overview"]["column_count"]
         dataset.status = "complete"
+        # Deliberately not committed here — persist_report's first commit
+        # (when it creates the report) flushes these dataset changes too,
+        # matching the original code's atomicity: dataset status and its
+        # report are committed together, not as two separate transactions.
 
-        overall_status = determine_overall_status(profile["issues"])
-        report = QualityReport(
+        report = persist_report(
+            db, profile, ai_summary,
             dataset_id=dataset.id,
-            profile_data=profile,
-            # Persist the full result dict so get_report returns the same
-            # shape as this endpoint — frontend always gets a result dict,
-            # never a raw string or a double-encoded JSON string.
-            ai_summary=json.dumps(ai_summary),
-            overall_status=overall_status
+            audit_action="profile_completed",
         )
-        db.add(report)
-        db.commit()
-        db.refresh(report)
-
-        log = AuditLog(
-            dataset_id=dataset.id,
-            report_id=report.id,
-            action="profile_completed",
-            detail=(
-                f"Profile and AI summary generated. "
-                f"Status: {overall_status}. "
-                f"Issues found: {len(profile['issues'])}. "
-                f"AI summary status: {ai_summary.get('status')}"
-            )
-        )
-        db.add(log)
-        db.commit()
 
         return {
             "message": "Profiling and AI analysis complete",
             "report_id": str(report.id),
-            "overall_status": overall_status,
+            "overall_status": report.overall_status,
             "overview": profile["overview"],
             "issues": profile["issues"],
-            # Return the result dict directly — frontend's extract_ai_content()
-            # reads {"status", "reason", "content"} and handles ok/failed both.
             "ai_summary": ai_summary,
         }
 
@@ -116,22 +131,17 @@ def get_report(report_id: str, db: Session = Depends(get_db)):
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
 
-    # ai_summary is stored as a JSON string — parse it back to a dict so
-    # the frontend always receives the same shape regardless of whether it
-    # fetched via this endpoint or the /profile endpoint above.
     ai_summary = report.ai_summary
     if isinstance(ai_summary, str):
         try:
             ai_summary = json.loads(ai_summary)
         except (json.JSONDecodeError, TypeError):
-            # Defensive: if for any reason it's a raw string (e.g. a report
-            # created before the hardening pass), wrap it in a result dict
-            # so the frontend's extract_ai_content() can handle it cleanly.
             ai_summary = {"status": "ok", "reason": None, "content": ai_summary}
 
     return {
         "id": str(report.id),
-        "dataset_id": str(report.dataset_id),
+        "dataset_id": str(report.dataset_id) if report.dataset_id else None,
+        "catalog_dataset_id": report.catalog_dataset_id,
         "profile_data": report.profile_data,
         "ai_summary": ai_summary,
         "overall_status": report.overall_status,
@@ -148,18 +158,21 @@ def get_technical_context(
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
 
-    dataset = db.query(Dataset).filter(Dataset.id == report.dataset_id).first()
+    # FIX: this used to do db.query(Dataset).filter(Dataset.id ==
+    # report.dataset_id).first() unconditionally, then reach for
+    # dataset.original_name — which breaks with an AttributeError on
+    # None for any catalog-sourced report, since report.dataset_id is
+    # None there. Now resolves whichever source the report actually has.
+    dataset, catalog_dataset = _get_report_source(report, db)
+    original_filename = _resolve_source_name(dataset, catalog_dataset)
 
-    # technical_brief is a result dict:
-    # {"status": "ok"|"failed", "reason": ..., "content": <TechnicalContext dict>}
-    # Returned directly — frontend's extract_ai_content() handles both statuses.
     technical_brief = generate_technical_context(
         profile_data=report.profile_data,
-        original_filename=dataset.original_name
+        original_filename=original_filename
     )
 
     log = AuditLog(
-        dataset_id=dataset.id,
+        dataset_id=dataset.id if dataset else None,
         report_id=report.id,
         action="technical_context_generated",
         detail=(
@@ -186,15 +199,13 @@ def ask_about_dataset(
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
 
-    dataset = db.query(Dataset).filter(Dataset.id == report.dataset_id).first()
+    # Same fix as get_technical_context above.
+    dataset, catalog_dataset = _get_report_source(report, db)
+    original_filename = _resolve_source_name(dataset, catalog_dataset)
 
-    # answer is a result dict:
-    # {"status": "ok"|"failed", "reason": ..., "content": <answer string>}
-    # Returned under the "answer" key — matches what the frontend expects
-    # (response.get("answer") -> extract_ai_content()).
     answer = answer_dataset_question(
         profile_data=report.profile_data,
-        original_filename=dataset.original_name,
+        original_filename=original_filename,
         question=request.question,
         conversation_history=request.conversation_history,
     )

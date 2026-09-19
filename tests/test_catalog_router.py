@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
+from app.models.catalog_dataset import CatalogDataset
 
 from db.database import Base, get_db
 from app.models.catalog_dataset import CatalogDataset
@@ -20,7 +21,8 @@ def db_session():
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
-    Base.metadata.create_all(bind=engine)
+    #Base.metadata.create_all(bind=engine)
+    CatalogDataset.__table__.create(bind=engine, checkfirst=True)
     SessionLocal = sessionmaker(bind=engine)
     session = SessionLocal()
     yield session

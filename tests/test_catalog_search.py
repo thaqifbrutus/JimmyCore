@@ -28,7 +28,8 @@ from app.services.catalog_search import (
 @pytest.fixture()
 def db_session():
     engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(bind=engine)
+    #Base.metadata.create_all(bind=engine)
+    CatalogDataset.__table__.create(bind=engine, checkfirst=True)
     SessionLocal = sessionmaker(bind=engine)
     session = SessionLocal()
     yield session

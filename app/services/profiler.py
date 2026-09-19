@@ -3,28 +3,30 @@ import numpy as np
 from datetime import datetime
 
 
-# Threshold for truncating individual string values inside top_values output.
-# Long narrative text dumped wholesale into the AI prompt's JSON payload was
-# the root cause of the repetition/looping bug — capping length here keeps
-# the profile output bounded regardless of what's in the source data.
 TOP_VALUE_MAX_LENGTH = 80
-
-# A column is considered "high-cardinality" for sampling-skip purposes when
-# its unique-value count is at or above this fraction of total row count.
 HIGH_CARDINALITY_RATIO = 0.95
-
-# A column is considered "long-form text" for sampling-skip purposes when
-# its average string length (from _get_string_patterns) is at or above this.
 LONG_FORM_TEXT_AVG_LENGTH = 50
 
 
 def profile_dataset(file_path: str) -> dict:
     """
     Reads a CSV file and returns a comprehensive profile of its contents.
-    This is the core intelligence of JimmyLens.
+    Thin wrapper around profile_dataframe — kept for the upload flow,
+    which has an actual file on disk. The government-catalog flow has no
+    file (data arrives as JSON from an API, converted to a DataFrame by
+    gov_data_client.py), so it calls profile_dataframe directly instead.
     """
     df = pd.read_csv(file_path)
+    return profile_dataframe(df)
 
+
+def profile_dataframe(df: pd.DataFrame) -> dict:
+    """
+    The actual profiling logic, operating on an in-memory DataFrame
+    regardless of where it came from — an uploaded CSV or a fetched
+    government dataset. This is the real entry point; profile_dataset()
+    above is just a CSV-reading convenience wrapper around it.
+    """
     profile = {
         "profiled_at": datetime.utcnow().isoformat(),
         "overview": _get_overview(df),
@@ -36,9 +38,6 @@ def profile_dataset(file_path: str) -> dict:
 
 
 def _get_overview(df: pd.DataFrame) -> dict:
-    """
-    High level summary of the entire dataset.
-    """
     total_cells = df.shape[0] * df.shape[1]
     total_nulls = df.isnull().sum().sum()
 
@@ -53,10 +52,6 @@ def _get_overview(df: pd.DataFrame) -> dict:
 
 
 def _get_column_profiles(df: pd.DataFrame) -> list:
-    """
-    Per-column breakdown. This is the most detailed section.
-    Every column tells its own story.
-    """
     column_profiles = []
 
     for col in df.columns:
@@ -73,15 +68,10 @@ def _get_column_profiles(df: pd.DataFrame) -> list:
             "unique_count": unique_count,
         }
 
-        # Numeric columns get extra statistical analysis
         if pd.api.types.is_numeric_dtype(series):
             col_profile["stats"] = _get_numeric_stats(series)
             col_profile["top_values"] = _get_top_values(series)
 
-        # String columns get pattern analysis. Pattern analysis is computed
-        # first because the resulting avg_length feeds the high-cardinality
-        # long-text check that decides whether top_values sampling runs at
-        # all for this column.
         elif pd.api.types.is_string_dtype(series) or pd.api.types.is_object_dtype(series):
             patterns = _get_string_patterns(series)
             col_profile["patterns"] = patterns
@@ -103,22 +93,8 @@ def _get_column_profiles(df: pd.DataFrame) -> list:
 
 
 def _should_skip_value_sampling(series: pd.Series, unique_count: int, total: int, patterns: dict) -> bool:
-    """
-    Decides whether "top values" sampling is meaningless for this column.
-
-    A column qualifies when it is both:
-    1. High-cardinality: nearly every value is unique (close to or equal to
-       total row count), so there's no real repetition to report.
-    2. Long-form text: the average string length (already computed by
-       _get_string_patterns) is long enough that dumping raw values into a
-       prompt risks bloating the payload with narrative text.
-
-    Reuses fields already computed elsewhere in the profiler — no new
-    statistical machinery, per the scope of this fix.
-    """
     if total == 0:
         return False
-
     if not patterns:
         return False
 
@@ -133,10 +109,6 @@ def _should_skip_value_sampling(series: pd.Series, unique_count: int, total: int
 
 
 def _get_numeric_stats(series: pd.Series) -> dict:
-    """
-    Statistical summary for numeric columns.
-    These are the signals that tell you if your numbers make sense.
-    """
     clean = series.dropna()
 
     return {
@@ -151,11 +123,6 @@ def _get_numeric_stats(series: pd.Series) -> dict:
 
 
 def _get_string_patterns(series: pd.Series) -> dict:
-    """
-    Pattern analysis for text columns.
-    Detects things like inconsistent casing, whitespace issues,
-    and whether a column might actually be something typed as text.
-    """
     clean = series.dropna().astype(str)
 
     if len(clean) == 0:
@@ -177,15 +144,6 @@ def _get_string_patterns(series: pd.Series) -> dict:
 
 
 def _get_top_values(series: pd.Series, n: int = 5) -> list:
-    """
-    Returns the most frequently occurring values in a column.
-    Useful for spotting dominant categories or suspicious repetition.
-
-    Individual values are truncated to TOP_VALUE_MAX_LENGTH characters
-    before being included — long narrative text values were previously
-    dumped wholesale into the AI prompt's JSON payload, which is what
-    triggered the repetition loop in the AI layer.
-    """
     top = series.value_counts().head(n)
 
     return [
@@ -195,24 +153,14 @@ def _get_top_values(series: pd.Series, n: int = 5) -> list:
 
 
 def _truncate_value(value: str, max_length: int = TOP_VALUE_MAX_LENGTH) -> str:
-    """
-    Truncates a string value to max_length characters, appending a marker
-    so it's clear in the output that truncation occurred.
-    """
     if len(value) <= max_length:
         return value
     return value[:max_length] + "...(truncated)"
 
 
 def _get_issues(df: pd.DataFrame) -> list:
-    """
-    Automatically detects and flags data quality issues.
-    This is JimmyLens being proactive — not just describing data,
-    but telling you what's wrong with it.
-    """
     issues = []
 
-    # Check for duplicate rows
     dup_count = df.duplicated().sum()
     if dup_count > 0:
         issues.append({
@@ -222,12 +170,10 @@ def _get_issues(df: pd.DataFrame) -> list:
             "affected": "entire dataset"
         })
 
-    # Check each column for issues
     for col in df.columns:
         series = df[col]
         null_pct = (series.isnull().sum() / len(series)) * 100
 
-        # Flag high null columns
         if null_pct > 50:
             issues.append({
                 "type": "high_nulls",
@@ -242,7 +188,6 @@ def _get_issues(df: pd.DataFrame) -> list:
                 "message": f"Column '{col}' has {null_pct:.1f}% missing values",
                 "affected": col
             })
-
         elif null_pct > 0:
             issues.append({
                 "type": "minimal_nulls",
@@ -251,7 +196,6 @@ def _get_issues(df: pd.DataFrame) -> list:
                 "affected": col
             })
 
-        # Flag columns that are entirely unique (potential ID columns stored wrong)
         if series.nunique() == len(series) and len(series) > 10:
             if not pd.api.types.is_numeric_dtype(series):
                 issues.append({
@@ -261,7 +205,6 @@ def _get_issues(df: pd.DataFrame) -> list:
                     "affected": col
                 })
 
-        # Flag numeric columns with negative values (context dependent)
         if pd.api.types.is_numeric_dtype(series):
             neg_count = (series < 0).sum()
             if neg_count > 0:
@@ -272,7 +215,6 @@ def _get_issues(df: pd.DataFrame) -> list:
                     "affected": col
                 })
 
-    # Determine overall health status
     severities = [i["severity"] for i in issues]
     if "critical" in severities:
         overall = "critical"
@@ -287,10 +229,6 @@ def _get_issues(df: pd.DataFrame) -> list:
 
 
 def determine_overall_status(issues: list) -> str:
-    """
-    Converts the issues list into a single status string.
-    Used to update the quality_reports table.
-    """
     severities = [i["severity"] for i in issues]
     if "critical" in severities:
         return "critical"
