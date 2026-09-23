@@ -3,7 +3,7 @@ from collections import Counter
 from openai import OpenAI
 from pydantic import ValidationError
 
-from app.config import OPENROUTER_API_KEY, AI_MODEL, OPENROUTER_APP_NAME, OPENROUTER_APP_URL
+from app.config import OPENROUTER_API_KEY, AI_MODEL, OPENROUTER_APP_NAME, OPENROUTER_APP_URL, AI_FALLBACK_MODELS
 from app.schemas import TechnicalContext, TECHNICAL_CONTEXT_JSON_SCHEMA
 
 client = OpenAI(
@@ -140,64 +140,85 @@ def _call_ai_model(
     model: str = AI_MODEL,
     response_format: dict | None = None,
 ) -> dict:
-    try:
-        kwargs = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": 0.3,
-            "extra_headers": _OPENROUTER_HEADERS,
+    """Call OpenRouter, trying the configured model chain when needed."""
+    model_chain = [model] + [
+        fallback_model
+        for fallback_model in AI_FALLBACK_MODELS
+        if fallback_model != model
+    ]
+    last_error = None
+    last_error_type = None
+
+    for attempt, current_model in enumerate(model_chain):
+        try:
+            kwargs = {
+                "model": current_model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": 0.3,
+                "extra_headers": _OPENROUTER_HEADERS,
+            }
+            if response_format is not None:
+                kwargs["response_format"] = response_format
+
+            response = client.chat.completions.create(**kwargs)
+
+        except Exception as exc:
+            error_type = None
+            if response_format is not None and _is_structured_output_unsupported_error(exc):
+                error_type = "structured_output_unsupported"
+                print(
+                    f"WARNING: Model {current_model} does not support structured output "
+                    f"(response_format) for {context_label}. Trying the next model."
+                )
+            else:
+                print(f"ERROR: OpenRouter call failed for {context_label} (model={current_model}): {exc}")
+
+            last_error = str(exc)
+            last_error_type = error_type
+            continue
+
+        choice = response.choices[0] if response.choices else None
+        finish_reason = choice.finish_reason if choice else None
+        text = choice.message.content if choice and choice.message else None
+
+        usage = None
+        if response.usage:
+            usage = {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens,
+            }
+
+        print(
+            f"INFO: AI call complete | context={context_label} | model={current_model} | "
+            f"finish_reason={finish_reason} | usage={usage}"
+        )
+
+        result = {
+            "status": "ok",
+            "text": text,
+            "finish_reason": finish_reason,
+            "usage": usage,
+            "error": None,
+            "error_type": None,
         }
-        if response_format is not None:
-            kwargs["response_format"] = response_format
 
-        response = client.chat.completions.create(**kwargs)
+        if not _needs_retry(result):
+            return result
 
-    except Exception as exc:
-        error_type = None
-        if response_format is not None and _is_structured_output_unsupported_error(exc):
-            error_type = "structured_output_unsupported"
-            print(
-                f"WARNING: Model {model} does not support structured output "
-                f"(response_format) for {context_label}. Will retry without it "
-                f"if a fallback path is available."
-            )
-        else:
-            print(f"ERROR: OpenRouter call failed for {context_label} (model={model}): {exc}")
-
-        return {
-            "status": "error",
-            "text": None,
-            "finish_reason": None,
-            "usage": None,
-            "error": str(exc),
-            "error_type": error_type,
-        }
-
-    choice = response.choices[0] if response.choices else None
-    finish_reason = choice.finish_reason if choice else None
-    text = choice.message.content if choice and choice.message else None
-
-    usage = None
-    if response.usage:
-        usage = {
-            "prompt_tokens": response.usage.prompt_tokens,
-            "completion_tokens": response.usage.completion_tokens,
-            "total_tokens": response.usage.total_tokens,
-        }
-
-    print(
-        f"INFO: AI call complete | context={context_label} | model={model} | "
-        f"finish_reason={finish_reason} | usage={usage}"
-    )
+        print(
+            f"INFO: AI output for {context_label} from {current_model} was unusable "
+            f"(empty, truncated, or degenerate). Trying the next model."
+        )
 
     return {
-        "status": "ok",
-        "text": text,
-        "finish_reason": finish_reason,
-        "usage": usage,
-        "error": None,
-        "error_type": None,
+        "status": "error",
+        "text": None,
+        "finish_reason": None,
+        "usage": None,
+        "error": last_error or "All configured models failed.",
+        "error_type": last_error_type,
     }
 
 

@@ -11,18 +11,27 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 # OpenRouter is the gateway across providers.
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# Single model slug used by default for all AI calls. Parameterized at the
-# call site (see ai_service._call_ai_model) so a different model could be
-# passed later without a refactor, even though nothing does that yet.
-#
-# meta-llama/llama-3.3-70b-instruct:free is used as the default here — it's
-# a long-standing, stable OpenRouter free-tier slug (available since the
-# model's release, still listed free as of mid-2026). OpenRouter's free
-# roster does rotate over time, so this should be revisited if the env var
-# ever returns a "model not found" error from OpenRouter — check
-# https://openrouter.ai/models for the current free-tier list and update
-# the AI_MODEL env var (no code change needed).
-AI_MODEL = os.getenv("AI_MODEL", "nex-agi/nex-n2-pro:free")
+# Default AI model — change this env var to use a different model.
+# Supported free-tier models (as of mid-2026):
+#   - meta-llama/llama-3.1-8b-instruct:free (recommended fallback)
+#   - meta-llama/llama-3.3-70b-instruct:free (original default)
+#   - other models may be available — set AI_MODEL env var to your preferred slug.
+AI_MODEL = os.getenv("AI_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
+
+# Fallback model chain — tried in order if the primary model fails or
+# returns a degenerate output. OpenRouter's free-tier roster rotates over
+# time, so a single model can become unavailable without warning; this
+# chain gives the app a chance to recover rather than fail outright.
+# Override via the AI_FALLBACK_MODELS env var (comma-separated list).
+_FALLBACK_MODELS_RAW = os.getenv("AI_FALLBACK_MODELS", "")
+AI_FALLBACK_MODELS = [
+    model.strip() for model in _FALLBACK_MODELS_RAW.split(",") if model.strip()
+] or [
+    "nvidia/nemotron-3.5-lightning:free",
+    "inclusionai/ling-3.0-flash-fin:free",
+    "thinkingmachines/inkling-small:free",
+
+]
 
 # OpenRouter's recommended optional headers, used for routing context and
 # abuse/cost monitoring on their end. Placeholder values — update if/when

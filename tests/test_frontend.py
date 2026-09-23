@@ -40,7 +40,6 @@ def test_switching_to_upload_mode_shows_file_uploader():
     at.run(timeout=15)
 
     assert not at.exception
-    # file_uploader widgets show up under at.get("file_uploader") in AppTest
     assert len(at.get("file_uploader")) == 1
 
 
@@ -50,7 +49,7 @@ def test_search_with_no_results_shows_info_message():
 
     with patch("frontend.requests.get", return_value=_mock_response(200, {"results": []})):
         at.text_input[0].set_value("some very specific query with no matches")
-        search_button = next(b for b in at.button if b.label == "🔍 Search")
+        search_button = next(b for b in at.button if b.label == "\U0001f50d Search")
         search_button.click()
         at.run(timeout=15)
 
@@ -80,7 +79,7 @@ def test_search_with_results_renders_dataset_cards():
 
     with patch("frontend.requests.get", return_value=_mock_response(200, fake_results)):
         at.text_input[0].set_value("drunk driving accidents")
-        search_button = next(b for b in at.button if b.label == "🔍 Search")
+        search_button = next(b for b in at.button if b.label == "\U0001f50d Search")
         search_button.click()
         at.run(timeout=15)
 
@@ -123,7 +122,7 @@ def test_analyze_button_populates_step_2_report(monkeypatch):
 
     with patch("frontend.requests.get", return_value=_mock_response(200, fake_results)):
         at.text_input[0].set_value("road accidents")
-        next(b for b in at.button if b.label == "🔍 Search").click()
+        next(b for b in at.button if b.label == "\U0001f50d Search").click()
         at.run(timeout=15)
 
     with patch("frontend.requests.post", return_value=_mock_response(200, fake_analysis)):
@@ -144,8 +143,45 @@ def test_search_api_error_shows_error_message():
 
     with patch("frontend.requests.get", side_effect=__import__("requests").exceptions.ConnectionError("refused")):
         at.text_input[0].set_value("anything")
-        next(b for b in at.button if b.label == "🔍 Search").click()
+        next(b for b in at.button if b.label == "\U0001f50d Search").click()
         at.run(timeout=15)
 
     assert not at.exception
     assert any("Search failed" in e.value for e in at.error)
+
+
+def test_enter_in_search_submits_the_form():
+    """Bug 2: pressing Enter inside the search box now triggers the search.
+
+    The text_input has on_change=_queue_search which sets a session-state
+    flag. When AppTest sets a value and re-runs, the callback fires and
+    the search runs — same outcome as pressing Enter in the real UI.
+    """
+    at = AppTest.from_file("../frontend.py")
+    at.run(timeout=15)
+
+    fake_results = {
+        "results": [
+            {
+                "id": "roadaccidents",
+                "title_en": "Road Accidents by State",
+                "category_en": "Transport",
+                "subcategory_en": "Safety",
+                "source": "PDRM",
+                "frequency": "Yearly",
+                "dataset_begin": 2010,
+                "dataset_end": 2024,
+                "score": 0.87,
+            }
+        ]
+    }
+
+    with patch("frontend.requests.get", return_value=_mock_response(200, fake_results)):
+        at.text_input[0].set_value("road accidents")
+        at.run(timeout=15)
+
+    assert not at.exception
+    assert at.session_state["search_error"] is None
+    assert at.session_state["search_results"] == fake_results["results"]
+    markdown_text = " ".join(m.value for m in at.markdown)
+    assert "Road Accidents by State" in markdown_text

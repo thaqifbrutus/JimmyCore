@@ -227,6 +227,13 @@ if "search_error" not in st.session_state:
     st.session_state.search_error = None
 if "source_label" not in st.session_state:
     st.session_state.source_label = None  # what Step 2's header calls the source
+if "_search_triggered" not in st.session_state:
+    st.session_state._search_triggered = False
+
+
+def _queue_search():
+    """Callback that fires when the user presses Enter in the search box."""
+    st.session_state._search_triggered = True
 
 
 def _reset_all():
@@ -257,11 +264,15 @@ if st.session_state.input_mode == "Search government data" and not st.session_st
             "Search query",
             placeholder="e.g. drunk driving accidents, fuel prices, unemployment rate",
             label_visibility="collapsed",
+            on_change=_queue_search,
         )
     with button_col:
         run_search = st.button("🔍 Search", type="primary", use_container_width=True)
 
-    if run_search and query.strip():
+    search_was_triggered = st.session_state._search_triggered
+    st.session_state._search_triggered = False
+
+    if run_search or (search_was_triggered and query.strip()):
         with st.spinner("Searching official datasets..."):
             results, error = search_catalog(query.strip())
             st.session_state.search_results = results
