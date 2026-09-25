@@ -36,9 +36,9 @@ def get_dataset(dataset_id: str, db: Session = Depends(get_db)):
         "column_count": dataset.column_count,
         "status": dataset.status,
         "uploaded_at": dataset.uploaded_at.isoformat(),
-        "latest_report": {"id": str(report.id),
-                          "overall_status": report.overall_status,
-                          "ai_summary": report.ai_summary,
-                          "created_at": report.created_at.isoformat()
-                          } if report else None
+        "latest_report": {
+            "id": str(report.id),
+            "ai_summary": report.ai_summary,
+            "created_at": report.created_at.isoformat(),
+        } if report else None
     }

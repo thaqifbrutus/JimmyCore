@@ -4,7 +4,7 @@ from openai import OpenAI
 from pydantic import ValidationError
 
 from app.config import OPENROUTER_API_KEY, AI_MODEL, OPENROUTER_APP_NAME, OPENROUTER_APP_URL, AI_FALLBACK_MODELS
-from app.schemas import TechnicalContext, TECHNICAL_CONTEXT_JSON_SCHEMA
+from app.schemas import DatasetOverview, DATASET_OVERVIEW_JSON_SCHEMA
 
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
@@ -18,49 +18,32 @@ _OPENROUTER_HEADERS = {
 
 SYSTEM_PROMPT = """
 
-You are JimmyCore AI, an expert data analyst and data quality specialist
-embedded inside an AI-powered data platform. You analyse two kinds of
-datasets: files a user uploads themselves, and official datasets found
-through JimmyCore's search of government open-data catalogs (such as
-Malaysia's data.gov.my).
+You are JimmyCore AI, a data analyst embedded in a platform for exploring
+official government datasets and user-uploaded data. You help users
+understand what a dataset contains and answer questions about it by
+querying the actual data with the tools provided.
 
-When analysing a dataset profile, you always:
-1. Explain what the dataset appears to contain in plain English
-2. Summarise the overall data quality in one clear sentence
-3. List and explain every quality issue found, ordered by severity
-4. Provide specific, actionable recommendations for each issue
-5. Give a final verdict on whether this data is ready to use
+When the profiling results include a "source" field, this dataset comes
+from an official government open-data catalog. In that case:
+- Name the source agency and category plainly when relevant.
+- Stick to what the data shows. Do not add outside knowledge, draw legal,
+  policy, or causal conclusions the data doesn't support, or speculate.
+- Cite the source when the user is making a decision based on the answer.
 
-Your tone is professional but conversational. You write for a mixed
-audience — some readers are developers, some are business analysts,
-some are project managers. Avoid jargon where possible. When you must
-use technical terms, briefly explain them.
+Tool use:
+- You have tools to inspect and query the dataset. Use them liberally —
+  don't guess at numbers when you can compute them.
+- Prefer computing over recalling. If a user asks "how many rows have X,"
+  call filter_rows and report the actual count.
+- When a tool returns truncated: true, tell the user the result was capped
+  and offer to narrow the query.
+- If a tool errors, read the error, adjust your arguments, and try again.
+  Do not give up after one failure.
+- When you cannot answer: if the data doesn't contain what's needed, say
+  so plainly. Do not fabricate. Offer what you can answer.
 
-Always be honest about data quality. Do not sugarcoat critical issues.
-If data is not ready for production use, say so clearly and explain why.
-
-When the profiling results include a "source" field, the dataset came
-from an official government open-data catalog rather than a user's own
-upload. When this is the case:
-- Name the source agency and category plainly if given, so the reader
-  knows exactly where the numbers come from (e.g. "This is published by
-  the Ministry of Transport under Road Safety statistics").
-- Stick strictly to describing and summarising what the dataset itself
-  shows. Do not add outside knowledge about the topic, do not draw legal,
-  policy, or causal conclusions the data doesn't directly support, and do
-  not speculate about context the profiling results don't contain. Your
-  job here is accurate retrieval and summary of an official source, not
-  interpretation — a reader using this to inform a real decision should
-  be pointed at the official data, not given your opinion dressed up as
-  it.
-
-When a column's sample values, descriptions, or unique value lists are long,
-irregular, or numerous, summarize the pattern in a short phrase (e.g.
-"long free-text descriptions, varying length" or "highly variable, 100+ unique
-values") instead of listing, describing, or repeating every value. Never repeat
-a word, phrase, or character sequence multiple times in a row. Every cell in a
-table must be a single short phrase or sentence, regardless of how complex or
-messy the underlying column data is.
+Tone: professional, conversational, precise. Write for mixed audiences —
+developers, analysts, project managers. Avoid jargon where possible.
 
 """
 
@@ -256,162 +239,61 @@ def _success_result(content) -> dict:
     }
 
 
-def generate_dataset_summary(profile_data: dict, original_filename: str) -> dict:
-    user_prompt = f"""
+# ---------------------------------------------------------------------------
+# Dataset overview — replaces the old generate_dataset_summary.
+# Produces a short orientation for the user plus a handful of suggested
+# starter questions. Structured output via json_schema, with the same
+# unsupported-model fallback path the old technical-context generator had.
+# ---------------------------------------------------------------------------
 
-Please analyse the following data profiling results for a dataset called "{original_filename}" and produce a comprehensive data quality report.
-
---- PROFILING RESULTS ---
-{json.dumps(profile_data, indent=2)}
---- END OF PROFILING RESULTS ---
-
-Your report should include:
-
-1. DATASET OVERVIEW
-   What does this dataset appear to contain?
-   How large is it? What are the key columns?
-
-2. OVERALL QUALITY ASSESSMENT
-   One clear sentence summarising the quality of this data.
-
-3. ISSUES FOUND
-   For each issue detected, explain:
-   - What the issue is in plain English
-   - Why it matters (what could go wrong if ignored)
-   - What should be done to fix it
-
-4. COLUMN HIGHLIGHTS
-   Call out any columns that are particularly interesting,
-   problematic, or worth noting.
-
-5. RECOMMENDATION
-   Is this data ready to use? If yes, with what caveats?
-   If no, what needs to happen before it can be used?
-
-Be specific. Reference actual column names and numbers from the profile.
-"""
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
-
-    result = _call_ai_model(messages, context_label=f"summary:{original_filename}", max_tokens=8000)
-
-    if not _needs_retry(result):
-        return _success_result(result["text"])
-
-    print(f"INFO: Retrying generate_dataset_summary for {original_filename} with fallback prompt")
-
-    fallback_prompt = f"""
-
-Please analyse the following data profiling results for "{original_filename}" and
-produce a SHORT data quality summary (3-5 sentences): what the dataset contains,
-its overall quality, and the single most important issue if any.
-
---- PROFILING RESULTS ---
-{json.dumps(profile_data, indent=2)}
---- END OF PROFILING RESULTS ---
-"""
-    fallback_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": fallback_prompt},
-    ]
-
-    retry_result = _call_ai_model(
-        fallback_messages, context_label=f"summary:{original_filename}:retry", max_tokens=2000
-    )
-
-    if not _needs_retry(retry_result):
-        return _success_result(retry_result["text"])
-
-    return _failure_result(
-        retry_result.get("error") or "Model produced empty, truncated, or degenerate output twice in a row."
-    )
-
-
-_TECHNICAL_CONTEXT_RESPONSE_FORMAT = {
+_DATASET_OVERVIEW_RESPONSE_FORMAT = {
     "type": "json_schema",
     "json_schema": {
-        "name": "technical_context",
+        "name": "dataset_overview",
         "strict": True,
-        "schema": TECHNICAL_CONTEXT_JSON_SCHEMA,
+        "schema": DATASET_OVERVIEW_JSON_SCHEMA,
     },
 }
 
 
-def _build_technical_context_prompt(profile_data: dict, original_filename: str, brief: bool = False, inline_schema: bool = False) -> str:
+def _build_dataset_overview_prompt(profile_data: dict, original_filename: str, inline_schema: bool = False) -> str:
     schema_instructions = f"""
 You MUST respond with ONLY a single JSON object — no markdown fences, no
 commentary before or after — that strictly matches this JSON Schema:
 
-{json.dumps(TECHNICAL_CONTEXT_JSON_SCHEMA, indent=2)}
+{json.dumps(DATASET_OVERVIEW_JSON_SCHEMA, indent=2)}
 """ if inline_schema else ""
-
-    if brief:
-        return f"""
-
-You are reviewing profiling results for "{original_filename}" to prepare a SHORT
-technical brief. Time/budget is limited — only produce the schema table and the
-effort rating. Skip risks/warnings and transformation steps detail; keep them minimal.
-
---- PROFILING RESULTS ---
-{json.dumps(profile_data, indent=2)}
---- END OF PROFILING RESULTS ---
-{schema_instructions}
-Respond with JSON matching this structure:
-- suggested_schema: list of {{column_name, detected_type, suggested_sql_type, notes}}
-- validation_rules: list of {{column_name, rules}} — can be minimal/empty per column
-- transformation_steps: list of {{column_name, transformation}} — can be minimal/empty per column
-- risks_and_warnings: list of strings — at most 1-2 brief items, or empty
-- estimated_effort: {{level: "Low"|"Medium"|"High", justification}}
-
-Keep every field short. No long prose anywhere.
-"""
 
     return f"""
 
-You are reviewing profiling results for "{original_filename}" to prepare technical
-context for a development team about to work with this data.
+You are writing an overview of the following dataset for a user who just
+selected it and is about to ask questions about it.
 
---- PROFILING RESULTS ---
+--- DATASET PROFILE ---
 {json.dumps(profile_data, indent=2)}
---- END OF PROFILING RESULTS ---
+--- END DATASET PROFILE ---
 {schema_instructions}
-Produce a technical brief as JSON with the following structure:
+Write 2-3 short paragraphs (no more) covering:
+1. What the dataset appears to cover — the domain, the entities, the key
+   dimensions (time, geography, categories).
+2. What's notable — coverage period, granularity, important columns,
+   anything a new user should know before asking questions.
 
-- suggested_schema: list of objects, one per column:
-  {{column_name, detected_type, suggested_sql_type, notes}}
-  Use notes to flag any columns where the detected type differs from what it
-  should be. Keep notes brief (one short phrase).
+Do NOT produce an issue list, severity ratings, or a "ready for use"
+verdict. This is an orientation, not an audit.
 
-- validation_rules: list of objects, one per column:
-  {{column_name, rules}}
-  Cover NOT NULL constraints, length limits, format checks, and foreign key
-  candidates where relevant. Combine multiple rules for the same column into
-  one string, separated by semicolons.
+Then produce 3-5 suggested starter questions the user might ask. They
+must be concrete, answerable from the data shown above, and varied in
+difficulty — mix simple lookups and counts with more analytical ones
+("What's the trend over time?", "Which state has the highest X?", "Are
+there missing values in the Y column?").
 
-- transformation_steps: list of objects, one per column that needs one:
-  {{column_name, transformation}}
-  Be specific but concise — one sentence per transformation.
-
-- risks_and_warnings: list of short strings (not objects).
-  What could go wrong during import or integration, and what assumptions are
-  being made about this data. Keep each item to one or two sentences.
-
-- estimated_effort: {{level, justification}}
-  level is exactly one of "Low", "Medium", or "High".
-  justification is one sentence.
-
-Be specific and technical. Keep every string field concise — no multi-sentence
-explanations packed into a single field, even if the dataset has many columns.
-This output will be used to create development tickets and database migration
-scripts, and may later be consumed programmatically, so keep field values
-clean and structured rather than narrative.
+Respond with JSON matching the provided schema. The "overview" field is
+the prose; the "suggested_questions" field is the list.
 """
 
 
-def _parse_technical_context(raw_text: str) -> TechnicalContext:
+def _parse_dataset_overview(raw_text: str) -> DatasetOverview:
     cleaned = raw_text.strip()
     if cleaned.startswith("```"):
         cleaned = cleaned.strip("`")
@@ -420,11 +302,11 @@ def _parse_technical_context(raw_text: str) -> TechnicalContext:
         cleaned = cleaned.strip()
 
     parsed = json.loads(cleaned)
-    return TechnicalContext.model_validate(parsed)
+    return DatasetOverview.model_validate(parsed)
 
 
-def generate_technical_context(profile_data: dict, original_filename: str) -> dict:
-    prompt = _build_technical_context_prompt(profile_data, original_filename, brief=False)
+def generate_dataset_overview(profile_data: dict, original_filename: str) -> dict:
+    prompt = _build_dataset_overview_prompt(profile_data, original_filename)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": prompt},
@@ -432,19 +314,19 @@ def generate_technical_context(profile_data: dict, original_filename: str) -> di
 
     result = _call_ai_model(
         messages,
-        context_label=f"technical_context:{original_filename}",
-        max_tokens=32000,
-        response_format=_TECHNICAL_CONTEXT_RESPONSE_FORMAT,
+        context_label=f"overview:{original_filename}",
+        max_tokens=4000,
+        response_format=_DATASET_OVERVIEW_RESPONSE_FORMAT,
     )
 
     parsed = None
     parse_error = None
     if not _needs_retry(result):
         try:
-            parsed = _parse_technical_context(result["text"])
+            parsed = _parse_dataset_overview(result["text"])
         except (json.JSONDecodeError, ValidationError) as exc:
             parse_error = str(exc)
-            print(f"WARNING: Technical context JSON failed validation for {original_filename}: {exc}")
+            print(f"WARNING: Dataset overview JSON failed validation for {original_filename}: {exc}")
 
     if parsed is not None:
         return _success_result(parsed.model_dump())
@@ -453,15 +335,14 @@ def generate_technical_context(profile_data: dict, original_filename: str) -> di
 
     if use_inline_schema_fallback:
         print(
-            f"INFO: Retrying generate_technical_context for {original_filename} "
-            f"WITHOUT response_format (model does not support structured output) "
-            f"— falling back to prompt-based JSON instructions"
+            f"INFO: Retrying generate_dataset_overview for {original_filename} "
+            f"WITHOUT response_format (model does not support structured output)"
         )
     else:
-        print(f"INFO: Retrying generate_technical_context for {original_filename} with fallback prompt")
+        print(f"INFO: Retrying generate_dataset_overview for {original_filename}")
 
-    fallback_prompt = _build_technical_context_prompt(
-        profile_data, original_filename, brief=True, inline_schema=use_inline_schema_fallback
+    fallback_prompt = _build_dataset_overview_prompt(
+        profile_data, original_filename, inline_schema=use_inline_schema_fallback
     )
     fallback_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -470,17 +351,17 @@ def generate_technical_context(profile_data: dict, original_filename: str) -> di
 
     retry_result = _call_ai_model(
         fallback_messages,
-        context_label=f"technical_context:{original_filename}:retry",
-        max_tokens=8000,
-        response_format=None if use_inline_schema_fallback else _TECHNICAL_CONTEXT_RESPONSE_FORMAT,
+        context_label=f"overview:{original_filename}:retry",
+        max_tokens=3000,
+        response_format=None if use_inline_schema_fallback else _DATASET_OVERVIEW_RESPONSE_FORMAT,
     )
 
     if not _needs_retry(retry_result):
         try:
-            retry_parsed = _parse_technical_context(retry_result["text"])
+            retry_parsed = _parse_dataset_overview(retry_result["text"])
             return _success_result(retry_parsed.model_dump())
         except (json.JSONDecodeError, ValidationError) as exc:
-            print(f"WARNING: Retry technical context JSON also failed validation for {original_filename}: {exc}")
+            print(f"WARNING: Retry dataset overview JSON also failed validation for {original_filename}: {exc}")
             return _failure_result(f"Model output failed schema validation on retry: {exc}")
 
     return _failure_result(
@@ -490,29 +371,42 @@ def generate_technical_context(profile_data: dict, original_filename: str) -> di
     )
 
 
-def answer_dataset_question(
-        profile_data: dict,
-        original_filename: str,
-        question: str,
-        conversation_history: list = None
-) -> dict:
-    context_message = f"""
+# ---------------------------------------------------------------------------
+# Q&A — now tool-driven. Delegates the loop to tool_runner, which owns the
+# model chain, iteration cap, and context-mode fallback.
+# ---------------------------------------------------------------------------
 
+def answer_dataset_question(
+    df,
+    profile_data: dict,
+    original_filename: str,
+    question: str,
+    conversation_history: list = None,
+) -> dict:
+    """
+    Delegates to tool_runner.run_tool_loop. Returns
+    {"status", "content", "reason", "tool_calls_log"}.
+
+    Local import of tool_runner to avoid a module-level import cycle
+    (tool_runner imports from this module).
+    """
+    from app.services import tool_runner
+
+    context_message = f"""
 The user is asking questions about a dataset called "{original_filename}".
-Here are the profiling results for full context:
+Here is a profile of the data for context:
 
 {json.dumps(profile_data, indent=2)}
 
-Answer the user's questions based on this profiling data.
-If the answer cannot be determined from the profiling data alone, say so clearly.
+Use the tools available to you to inspect and query the actual data when
+answering. Prefer computing over recalling.
 """
 
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": context_message},
         {
             "role": "assistant",
-            "content": "Understood. I have reviewed the profiling results and I am ready to answer questions about this dataset.",
+            "content": "Understood. I have the profile and access to the data. Ready to answer.",
         },
     ]
 
@@ -522,27 +416,9 @@ If the answer cannot be determined from the profiling data alone, say so clearly
 
     messages.append({"role": "user", "content": question})
 
-    result = _call_ai_model(
-        messages, context_label=f"qa:{original_filename}", max_tokens=3000
-    )
-
-    if not _needs_retry(result):
-        return _success_result(result["text"])
-
-    print(f"INFO: Retrying answer_dataset_question for {original_filename} with fallback prompt")
-
-    fallback_question = (
-        f"{question}\n\n(Please answer as briefly as possible — a few sentences at most.)"
-    )
-    fallback_messages = messages[:-1] + [{"role": "user", "content": fallback_question}]
-
-    retry_result = _call_ai_model(
-        fallback_messages, context_label=f"qa:{original_filename}:retry", max_tokens=1000
-    )
-
-    if not _needs_retry(retry_result):
-        return _success_result(retry_result["text"])
-
-    return _failure_result(
-        retry_result.get("error") or "Model produced empty, truncated, or degenerate output twice in a row."
+    return tool_runner.run_tool_loop(
+        df=df,
+        messages=messages,
+        system_prompt=SYSTEM_PROMPT,
+        context_label=f"qa:{original_filename}",
     )

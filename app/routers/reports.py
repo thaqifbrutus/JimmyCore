@@ -5,11 +5,11 @@ from app.models.dataset import Dataset
 from app.models.report import QualityReport
 from app.models.catalog_dataset import CatalogDataset
 from app.models.audit_log import AuditLog
+from app.services import data_loader
 from app.services.profiler import profile_dataset
 from app.services.report_builder import persist_report
 from app.services.ai_service import (
-    generate_dataset_summary,
-    generate_technical_context,
+    generate_dataset_overview,
     answer_dataset_question,
 )
 from pydantic import BaseModel
@@ -82,9 +82,9 @@ def trigger_profile(
     try:
         profile = profile_dataset(file_path)
 
-        ai_summary = generate_dataset_summary(
+        overview = generate_dataset_overview(
             profile_data=profile,
-            original_filename=dataset.original_name
+            original_filename=dataset.original_name,
         )
 
         dataset.row_count = profile["overview"]["row_count"]
@@ -96,18 +96,18 @@ def trigger_profile(
         # report are committed together, not as two separate transactions.
 
         report = persist_report(
-            db, profile, ai_summary,
+            db, profile, overview,
             dataset_id=dataset.id,
             audit_action="profile_completed",
         )
 
         return {
-            "message": "Profiling and AI analysis complete",
             "report_id": str(report.id),
-            "overall_status": report.overall_status,
-            "overview": profile["overview"],
-            "issues": profile["issues"],
-            "ai_summary": ai_summary,
+            "dataset_id": str(dataset.id),
+            "dataset_stats": profile["overview"],
+            "columns": profile["columns"],
+            "overview": overview,
+            "source": None,
         }
 
     except Exception as e:
@@ -144,48 +144,7 @@ def get_report(report_id: str, db: Session = Depends(get_db)):
         "catalog_dataset_id": report.catalog_dataset_id,
         "profile_data": report.profile_data,
         "ai_summary": ai_summary,
-        "overall_status": report.overall_status,
         "created_at": report.created_at.isoformat()
-    }
-
-
-@router.post("/{report_id}/technical-context")
-def get_technical_context(
-    report_id: str,
-    db: Session = Depends(get_db)
-):
-    report = db.query(QualityReport).filter(QualityReport.id == report_id).first()
-    if not report:
-        raise HTTPException(status_code=404, detail="Report not found")
-
-    # FIX: this used to do db.query(Dataset).filter(Dataset.id ==
-    # report.dataset_id).first() unconditionally, then reach for
-    # dataset.original_name — which breaks with an AttributeError on
-    # None for any catalog-sourced report, since report.dataset_id is
-    # None there. Now resolves whichever source the report actually has.
-    dataset, catalog_dataset = _get_report_source(report, db)
-    original_filename = _resolve_source_name(dataset, catalog_dataset)
-
-    technical_brief = generate_technical_context(
-        profile_data=report.profile_data,
-        original_filename=original_filename
-    )
-
-    log = AuditLog(
-        dataset_id=dataset.id if dataset else None,
-        report_id=report.id,
-        action="technical_context_generated",
-        detail=(
-            f"Technical brief generated. "
-            f"Status: {technical_brief.get('status')}"
-        )
-    )
-    db.add(log)
-    db.commit()
-
-    return {
-        "report_id": report_id,
-        "technical_brief": technical_brief,
     }
 
 
@@ -199,11 +158,16 @@ def ask_about_dataset(
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
 
-    # Same fix as get_technical_context above.
     dataset, catalog_dataset = _get_report_source(report, db)
     original_filename = _resolve_source_name(dataset, catalog_dataset)
 
+    try:
+        df = data_loader.load_dataframe_for_report(report, db)
+    except data_loader.DataLoadError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
     answer = answer_dataset_question(
+        df=df,
         profile_data=report.profile_data,
         original_filename=original_filename,
         question=request.question,
@@ -214,4 +178,5 @@ def ask_about_dataset(
         "question": request.question,
         "answer": answer,
         "report_id": report_id,
+        "tool_calls_log": answer.get("tool_calls_log", []),
     }

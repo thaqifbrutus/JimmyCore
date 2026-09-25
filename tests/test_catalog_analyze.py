@@ -1,33 +1,45 @@
 """
 Integration tests for POST /catalog/{catalog_dataset_id}/analyze.
 
-VERIFICATION STATUS — same situation as tests/test_routes.py from Round 2:
-QualityReport uses Postgres-specific JSONB/UUID columns, which don't
-compile on SQLite (confirmed back in Round 2). These tests therefore need
-a real Postgres to actually run — the same docker-compose.test.yml setup
-from Round 2 applies here too. They are NOT executed in this sandbox.
-Unlike test_profiler.py and test_reports_source_resolution.py (both fully
-run, all passing, in this same round), these are written against the
-same well-established FastAPI + SQLAlchemy patterns used everywhere else
-in this codebase, but not proven against a live database.
+STATUS: skipped. These tests cannot run in the current sandbox for two
+reasons:
+  1. They require a `client` fixture that has never been defined — a
+     tests/conftest.py would need to provide a FastAPI TestClient with
+     a database session override.
+  2. They require a real Postgres. QualityReport uses JSONB and UUID
+     columns which SQLite cannot compile.
 
-All external calls (gov_data_client's live fetch, ai_service's LLM call)
-are mocked — this suite tests whether the endpoint wires the DB, the
-fetch/cache client, the profiler, and the AI summary together correctly,
-not the quality of any of those pieces individually (each has its own
-dedicated, already-passing test suite).
+They are kept on disk as a specification of the endpoint's expected
+behavior. Restoring them requires: (a) adding tests/conftest.py with
+shared `client` and `db_session` fixtures backed by Postgres, and
+(b) removing the pytestmark skip below.
 """
 import pandas as pd
 import pytest
 
+pytestmark = pytest.mark.skip(
+    reason="requires Postgres and a shared `client`/`db_session` conftest fixture — "
+           "not runnable in the current sandbox. See module docstring."
+)
 
 @pytest.fixture(autouse=True)
 def _isolated_dir(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
 
-def _mock_ai_success(content):
-    return {"status": "ok", "reason": None, "content": content}
+def _mock_overview_success(overview_text, questions=None):
+    return {
+        "status": "ok",
+        "reason": None,
+        "content": {
+            "overview": overview_text,
+            "suggested_questions": questions or [
+                "What's the coverage period?",
+                "Which category appears most often?",
+                "Are there missing values?",
+            ],
+        },
+    }
 
 
 def _seed_catalog_dataset(db, id="fuelprice", title_en="Fuel Prices"):
@@ -48,7 +60,7 @@ def test_analyze_404s_for_unknown_catalog_dataset(client):
     assert response.status_code == 404
 
 
-def test_analyze_end_to_end_with_mocked_fetch_and_ai(client, db_session, monkeypatch):
+def test_analyze_end_to_end_with_mocked_fetch_and_overview(client, db_session, monkeypatch):
     from app.routers import catalog as catalog_router
 
     _seed_catalog_dataset(db_session)
@@ -57,20 +69,44 @@ def test_analyze_end_to_end_with_mocked_fetch_and_ai(client, db_session, monkeyp
         {"date": "2024-01-01", "price": 2.05},
         {"date": "2024-01-02", "price": 2.10},
     ])
-    monkeypatch.setattr(catalog_router, "get_dataset_dataframe", lambda db, id, force_refresh=False: fake_df)
     monkeypatch.setattr(
-        catalog_router, "generate_dataset_summary",
-        lambda profile_data, original_filename: _mock_ai_success("Fuel prices look stable."),
+        catalog_router, "get_dataset_dataframe",
+        lambda db, id, force_refresh=False: fake_df,
+    )
+    monkeypatch.setattr(
+        catalog_router, "generate_dataset_overview",
+        lambda profile_data, original_filename: _mock_overview_success(
+            "Fuel prices look stable across the period."
+        ),
     )
 
     response = client.post("/catalog/fuelprice/analyze")
 
     assert response.status_code == 200
     body = response.json()
+
     assert body["catalog_dataset_id"] == "fuelprice"
-    assert body["overview"]["row_count"] == 2
-    assert body["ai_summary"]["content"] == "Fuel prices look stable."
     assert "report_id" in body
+
+    # New shape: dataset_stats + columns + overview + source
+    assert body["dataset_stats"]["row_count"] == 2
+    assert body["dataset_stats"]["column_count"] == 2
+    assert isinstance(body["columns"], list)
+    assert len(body["columns"]) == 2
+
+    assert body["overview"]["status"] == "ok"
+    assert body["overview"]["content"]["overview"] == (
+        "Fuel prices look stable across the period."
+    )
+    assert len(body["overview"]["content"]["suggested_questions"]) == 3
+
+    assert "source" in body
+
+    # Fields dropped from the old shape — must NOT be present.
+    assert "overall_status" not in body
+    assert "issues" not in body
+    assert "ai_summary" not in body
+    assert "message" not in body
 
 
 def test_analyze_returns_422_for_empty_dataset(client, db_session, monkeypatch):
@@ -78,7 +114,10 @@ def test_analyze_returns_422_for_empty_dataset(client, db_session, monkeypatch):
 
     _seed_catalog_dataset(db_session, id="empty_ds")
 
-    monkeypatch.setattr(catalog_router, "get_dataset_dataframe", lambda db, id, force_refresh=False: pd.DataFrame())
+    monkeypatch.setattr(
+        catalog_router, "get_dataset_dataframe",
+        lambda db, id, force_refresh=False: pd.DataFrame(),
+    )
 
     response = client.post("/catalog/empty_ds/analyze")
 
@@ -103,7 +142,9 @@ def test_analyze_returns_502_when_gov_api_fetch_fails(client, db_session, monkey
     assert "Could not fetch government data" in response.json()["detail"]
 
 
-def test_analyze_report_is_readable_via_existing_get_report_endpoint(client, db_session, monkeypatch):
+def test_analyze_report_is_readable_via_existing_get_report_endpoint(
+    client, db_session, monkeypatch
+):
     """
     The real point of the shared QualityReport table: a report created by
     the NEW analyze endpoint should be fully readable by the EXISTING
@@ -111,22 +152,35 @@ def test_analyze_report_is_readable_via_existing_get_report_endpoint(client, db_
     """
     from app.routers import catalog as catalog_router
 
-    _seed_catalog_dataset(db_session, id="roadaccidents", title_en="Road Accidents")
+    _seed_catalog_dataset(
+        db_session, id="roadaccidents", title_en="Road Accidents"
+    )
 
     fake_df = pd.DataFrame([{"state": "Selangor", "count": 120}])
-    monkeypatch.setattr(catalog_router, "get_dataset_dataframe", lambda db, id, force_refresh=False: fake_df)
     monkeypatch.setattr(
-        catalog_router, "generate_dataset_summary",
-        lambda profile_data, original_filename: _mock_ai_success("Selangor has the most incidents."),
+        catalog_router, "get_dataset_dataframe",
+        lambda db, id, force_refresh=False: fake_df,
+    )
+    monkeypatch.setattr(
+        catalog_router, "generate_dataset_overview",
+        lambda profile_data, original_filename: _mock_overview_success(
+            "Selangor has the most incidents."
+        ),
     )
 
     analyze_response = client.post("/catalog/roadaccidents/analyze")
+    assert analyze_response.status_code == 200
     report_id = analyze_response.json()["report_id"]
 
     get_response = client.get(f"/reports/{report_id}")
-
     assert get_response.status_code == 200
     body = get_response.json()
+
     assert body["catalog_dataset_id"] == "roadaccidents"
     assert body["dataset_id"] is None
-    assert body["ai_summary"]["content"] == "Selangor has the most incidents."
+    # ai_summary column stores the overview dict now.
+    assert body["ai_summary"]["content"]["overview"] == (
+        "Selangor has the most incidents."
+    )
+    # overall_status was dropped from this response shape.
+    assert "overall_status" not in body

@@ -29,7 +29,7 @@ AI_FALLBACK_MODELS = [
 ] or [
     "nvidia/nemotron-3.5-lightning:free",
     "inclusionai/ling-3.0-flash-fin:free",
-    "thinkingmachines/inkling-small:free",
+    "qwen/qwen3.8-27b:free",
 
 ]
 

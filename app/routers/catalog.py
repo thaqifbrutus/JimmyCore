@@ -6,7 +6,7 @@ from app.services.catalog_sync import sync_catalog
 from app.services.catalog_search import generate_catalog_embeddings, search_catalog
 from app.services.gov_data_client import get_dataset_dataframe, GovAPIError
 from app.services.profiler import profile_dataframe
-from app.services.ai_service import generate_dataset_summary, build_source_context
+from app.services.ai_service import generate_dataset_overview, build_source_context
 from app.services.report_builder import persist_report
 
 router = APIRouter()
@@ -73,9 +73,10 @@ def analyze_catalog_dataset(
 ):
     """
     Given a dataset id (found via /catalog/search), fetches its real data
-    (cached or live), profiles it, generates an AI summary, and persists
-    a QualityReport — the same shape as the upload flow, so every
-    existing /reports/{id} endpoint works on the result unchanged.
+    (cached or live), profiles it, generates an AI overview plus suggested
+    starter questions, and persists a QualityReport — the same shape as
+    the upload flow, so every existing /reports/{id} endpoint works on
+    the result unchanged.
 
     The profile's "source" field (see build_source_context in
     ai_service.py) tells the model this is an official government dataset
@@ -83,7 +84,9 @@ def analyze_catalog_dataset(
     summarizing rather than interpreting — see SYSTEM_PROMPT for why that
     distinction matters here specifically.
     """
-    catalog_dataset = db.query(CatalogDataset).filter(CatalogDataset.id == catalog_dataset_id).first()
+    catalog_dataset = (
+        db.query(CatalogDataset).filter(CatalogDataset.id == catalog_dataset_id).first()
+    )
     if not catalog_dataset:
         raise HTTPException(status_code=404, detail="Catalog dataset not found")
 
@@ -95,32 +98,35 @@ def analyze_catalog_dataset(
     if len(df) == 0:
         raise HTTPException(
             status_code=422,
-            detail=f"Dataset '{catalog_dataset_id}' returned no rows from the government API — nothing to analyze.",
+            detail=(
+                f"Dataset '{catalog_dataset_id}' returned no rows from the "
+                f"government API — nothing to analyze."
+            ),
         )
 
     try:
         profile = profile_dataframe(df)
-        profile["source"] = build_source_context(catalog_dataset)
+        source = build_source_context(catalog_dataset)
+        profile["source"] = source
 
-        ai_summary = generate_dataset_summary(
+        overview = generate_dataset_overview(
             profile_data=profile,
             original_filename=catalog_dataset.title_en,
         )
 
         report = persist_report(
-            db, profile, ai_summary,
+            db, profile, overview,
             catalog_dataset_id=catalog_dataset.id,
-            audit_action="catalog_profile_completed",
+            audit_action="catalog_overview_generated",
         )
 
         return {
-            "message": "Government dataset fetched, profiled, and AI-summarized",
             "report_id": str(report.id),
             "catalog_dataset_id": catalog_dataset.id,
-            "overall_status": report.overall_status,
-            "overview": profile["overview"],
-            "issues": profile["issues"],
-            "ai_summary": ai_summary,
+            "dataset_stats": profile["overview"],
+            "columns": profile["columns"],
+            "overview": overview,
+            "source": source,
         }
 
     except Exception as e:
