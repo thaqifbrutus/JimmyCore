@@ -284,10 +284,10 @@ def _success_result(content) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Dataset overview — replaces the old generate_dataset_summary.
-# Produces a short orientation for the user plus a handful of suggested
-# starter questions. Structured output via json_schema, with the same
-# unsupported-model fallback path the old technical-context generator had.
+# Dataset overview — produces a short orientation, suggested questions,
+# and a hint (primary_column + primary_metric) about what to chart.
+# Structured output via json_schema, with the same unsupported-model
+# fallback path the old technical-context generator had.
 # ---------------------------------------------------------------------------
 
 _DATASET_OVERVIEW_RESPONSE_FORMAT = {
@@ -332,8 +332,31 @@ difficulty — mix simple lookups and counts with more analytical ones
 ("What's the trend over time?", "Which state has the highest X?", "Are
 there missing values in the Y column?").
 
+Finally, choose what to chart. Two related fields:
+
+- primary_column: a categorical, time, or low-cardinality dimension
+  to plot on the x-axis — a state column, a category column, a year
+  column, a type column. Do NOT pick a free-text identifier, a
+  mostly-null column, or a high-cardinality column (more than ~50
+  distinct values). If no column is chart-worthy, respond with
+  "primary_column": null.
+
+- primary_metric: if the dataset contains a NUMERIC column whose sum
+  by primary_column would tell the reader something interesting — a
+  count of cases, a total, a measured quantity — name it here. The
+  chart will then show "sum of {{primary_metric}} by {{primary_column}}"
+  (for example, "sum of total_cases by state"), which is usually more
+  informative than a raw frequency count. If there is no numeric
+  column, or none of them makes sense summed by the chosen
+  primary_column, respond with "primary_metric": null. A dataset that
+  is purely categorical (IDs and labels, no measures) should have
+  "primary_metric": null, and the chart will fall back to a count of
+  rows per category.
+
 Respond with JSON matching the provided schema. The "overview" field is
-the prose; the "suggested_questions" field is the list.
+the prose; the "suggested_questions" field is the list;
+"primary_column" and "primary_metric" are the chart hints (either may
+be null).
 """
 
 

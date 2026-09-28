@@ -42,7 +42,23 @@ def _fake_search_results():
     }
 
 
-def _fake_analysis_result():
+def _fake_analysis_result(overview_chart=None):
+    """
+    overview_chart: override the chart on the overview. Default is a
+    count-based chart; pass a dict to inject a sum-based one for tests
+    that exercise the sum caption path.
+    """
+    if overview_chart is None:
+        overview_chart = {
+            "column": "state",
+            "metric": None,
+            "kind": "count",
+            "values": [
+                {"value": "Selangor", "count": 12},
+                {"value": "Johor", "count": 8},
+            ],
+            "truncated": False,
+        }
     return {
         "report_id": "abc-123",
         "catalog_dataset_id": "roadaccidents",
@@ -63,7 +79,10 @@ def _fake_analysis_result():
                     "What's the trend over time?",
                     "Are there missing values?",
                 ],
+                "primary_column": "state",
+                "primary_metric": None,
             },
+            "chart": overview_chart,
         },
         "source": {"type": "official_government_dataset"},
     }
@@ -98,7 +117,7 @@ def _has_bar_chart(at):
     return False
 
 
-def _drive_to_detail_view(at, fake_results=None):
+def _drive_to_detail_view(at, fake_results=None, analysis=None):
     """Search → click Analyze → land on the detail page. Returns the
     AppTest instance, mutated in place."""
     fake_results = fake_results or _fake_search_results()
@@ -107,7 +126,7 @@ def _drive_to_detail_view(at, fake_results=None):
         next(b for b in at.button if b.label == "\U0001f50d Search").click()
         at.run(timeout=15)
 
-    with patch("frontend.requests.post", side_effect=_fake_post_dispatcher()):
+    with patch("frontend.requests.post", side_effect=_fake_post_dispatcher(analysis=analysis)):
         next(b for b in at.button if b.label == "Analyze").click()
         at.run(timeout=15)
     return at
@@ -183,6 +202,49 @@ def test_analyze_button_populates_detail_view_with_overview_and_suggested_questi
     assert not any("Technical brief" in m for m in markdown_text)
     assert not any(b.label == "Generate technical brief" for b in at.button)
 
+    # Round B: overview chart renders under the prose
+    assert _has_bar_chart(at), "expected a bar chart in the detail view"
+
+    # Count-based chart → caption should read "Top N values of `state`"
+    caption_text = " ".join(c.value for c in at.caption)
+    assert "values of `state`" in caption_text
+
+
+def test_overview_chart_shows_sum_caption_when_metric_provided():
+    """
+    When the model returns a primary_metric, the overview chart is
+    sum-based and the caption should read "Top N `state` by `cases`"
+    instead of "Top N values of `state`".
+    """
+    at = AppTest.from_file("../frontend.py")
+    at.run(timeout=15)
+
+    sum_chart = {
+        "column": "state",
+        "metric": "total_cases",
+        "kind": "sum",
+        "values": [
+            {"value": "Johor", "count": 3191},
+            {"value": "Kedah", "count": 2975},
+            {"value": "Kelantan", "count": 2780},
+        ],
+        "truncated": False,
+    }
+    analysis = _fake_analysis_result(overview_chart=sum_chart)
+    # Make primary_metric match, for internal consistency.
+    analysis["overview"]["content"]["primary_metric"] = "total_cases"
+
+    _drive_to_detail_view(at, analysis=analysis)
+
+    assert not at.exception
+    assert _has_bar_chart(at), "expected a bar chart in the detail view"
+
+    caption_text = " ".join(c.value for c in at.caption)
+    assert "`state`" in caption_text
+    assert "`total_cases`" in caption_text
+    # The count-based phrasing must NOT be present for a sum chart.
+    assert "values of" not in caption_text
+
 
 def test_suggested_question_button_submits_question_to_chat():
     at = AppTest.from_file("../frontend.py")
@@ -247,7 +309,6 @@ def test_search_api_error_shows_error_message():
 
 
 def test_enter_in_search_submits_the_form():
-    """Pressing Enter inside the search box triggers the search."""
     at = AppTest.from_file("../frontend.py")
     at.run(timeout=15)
 
@@ -262,9 +323,20 @@ def test_enter_in_search_submits_the_form():
     assert "Road Accidents by State" in markdown_text
 
 
-# ── A1: provenance expander ────────────────────────────────────────────────
+# ── A1/B6: provenance demoted behind an icon button ────────────────────────
 
-def test_provenance_expander_renders_for_assistant_message():
+def test_provenance_is_hidden_behind_button():
+    """
+    Round B replaced the big 🔍 How I got this answer expander with a
+    single discreet ⚙️ Tool calls (N) popover.
+
+    Streamlit's AppTest in 1.58 does NOT surface st.popover widgets in
+    its element tree (verified: at.button, at.expander, and
+    at.get("popover") all come up empty for the popover, while the
+    browser renders it correctly). So we assert at the data layer:
+    the old prominent label is gone, and tool_calls are attached to
+    the assistant message — which is what drives the popover render.
+    """
     at = AppTest.from_file("../frontend.py")
     at.run(timeout=15)
 
@@ -301,32 +373,22 @@ def test_provenance_expander_renders_for_assistant_message():
 
     assert not at.exception
 
-    # The expander LABEL is a widget attribute, not markdown content.
-    expander_labels = [e.label for e in at.expander]
-    assert any(
-        "How I got this answer" in label for label in expander_labels
-    ), f"expected a 'How I got this answer' expander; got labels: {expander_labels}"
-
-    # Tool call detail is rendered by THREE different Streamlit primitives:
-    #   st.markdown  → tool name
-    #   st.code      → arguments JSON
-    #   st.caption   → result_summary
-    # AppTest surfaces each of these as a SEPARATE collection. The previous
-    # version of this test checked only at.markdown, which is why the
-    # result_summary assertion kept failing even though the UI renders it.
     markdown_text = " ".join(m.value for m in at.markdown)
-    caption_text = " ".join(c.value for c in at.caption)
-    code_text = " ".join(c.value for c in at.code)
+    assert "How I got this answer" not in markdown_text
 
-    assert "filter_rows" in markdown_text
-    assert "17 rows matched" in caption_text or "17 rows matched" in markdown_text, (
-        f"expected result_summary in captions or markdown; "
-        f"captions={[c.value for c in at.caption]} "
-        f"markdown={[m.value for m in at.markdown]}"
+    assistant_msgs = [
+        m for m in at.session_state["messages"] if m["role"] == "assistant"
+    ]
+    assert assistant_msgs, "expected at least one assistant message"
+    last_assistant = assistant_msgs[-1]
+    assert last_assistant.get("tool_calls"), (
+        "expected tool_calls attached to the assistant message — this is "
+        "what the ⚙️ Tool calls popover renders from"
     )
+    assert last_assistant["tool_calls"][0]["name"] == "filter_rows"
 
 
-# ── A5: inline bar chart inside the provenance expander ────────────────────
+# ── A5/B5: inline chart under the answer text ──────────────────────────────
 
 def test_bar_chart_renders_for_value_counts_tool_call():
     at = AppTest.from_file("../frontend.py")
@@ -364,7 +426,102 @@ def test_bar_chart_renders_for_value_counts_tool_call():
         at.run(timeout=15)
 
     assert not at.exception
-    assert _has_bar_chart(at), "expected a bar chart element in the provenance expander"
+    assert _has_bar_chart(at), "expected a bar chart under the answer text"
+
+
+def test_inline_chart_renders_under_answer_text():
+    at = AppTest.from_file("../frontend.py")
+    at.run(timeout=15)
+
+    fake_ask = {
+        "question": "Show me the breakdown",
+        "answer": {
+            "status": "ok",
+            "reason": None,
+            "content": "Here's the breakdown.",
+        },
+        "report_id": "abc-123",
+        "tool_calls_log": [
+            {
+                "name": "aggregate",
+                "arguments": {
+                    "group_by": "state",
+                    "agg_column": "count",
+                    "agg_func": "sum",
+                },
+                "result_summary": "3 groups",
+                "chart_data": [
+                    {"group": "Selangor", "value": 1200},
+                    {"group": "Johor", "value": 800},
+                    {"group": "Penang", "value": 400},
+                ],
+            }
+        ],
+    }
+
+    _drive_to_detail_view(at)
+
+    with patch("frontend.requests.post", side_effect=_fake_post_dispatcher(ask=fake_ask)):
+        suggested = next(
+            b for b in at.button if b.label == "Which state has the most accidents?"
+        )
+        suggested.click()
+        at.run(timeout=15)
+
+    assert not at.exception
+    assert _has_bar_chart(at)
+
+
+def test_no_chart_when_no_tool_call_has_chart_data():
+    """When every tool call carries chart_data=None, no chat chart renders."""
+    at = AppTest.from_file("../frontend.py")
+    at.run(timeout=15)
+
+    fake_ask = {
+        "question": "How many rows are there?",
+        "answer": {
+            "status": "ok",
+            "reason": None,
+            "content": "There are 500 rows.",
+        },
+        "report_id": "abc-123",
+        "tool_calls_log": [
+            {
+                "name": "get_schema",
+                "arguments": {},
+                "result_summary": "4 columns",
+                "chart_data": None,
+            },
+            {
+                "name": "get_sample_rows",
+                "arguments": {"n": 5},
+                "result_summary": "5 rows",
+                "chart_data": None,
+            },
+        ],
+    }
+
+    _drive_to_detail_view(at)
+
+    with patch("frontend.requests.post", side_effect=_fake_post_dispatcher(ask=fake_ask)):
+        suggested = next(
+            b for b in at.button if b.label == "Which state has the most accidents?"
+        )
+        suggested.click()
+        at.run(timeout=15)
+
+    assert not at.exception
+    # Detail view still shows its own overview chart, so at most one
+    # chart should be present (no chat chart was added).
+    chart_count = 0
+    for key in ("bar_chart", "arrow_vega_lite_chart", "vega_lite_chart"):
+        try:
+            chart_count += len(at.get(key))
+        except Exception:
+            pass
+    assert chart_count <= 1, (
+        f"expected only the overview chart, got {chart_count} chart elements"
+    )
 
 
 # ── A3: quota-exhausted error message ──────────────────────────────────────

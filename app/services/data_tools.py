@@ -297,7 +297,6 @@ def filter_rows(df: pd.DataFrame, column: str, operator: str, value: Any, limit:
                 f"column and agg_func='count' or 'sum'."
             )
         return result
-    
     except Exception as e:
         return {"error": str(e)}
 
@@ -360,6 +359,213 @@ def aggregate(df: pd.DataFrame, group_by: str, agg_column: str, agg_func: str) -
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Chart data helpers — separate from the tools above on purpose.
+#
+# The tools are the model-facing surface (schemas, dedup, iteration budget
+# apply). These helpers are UI-facing: they produce a simpler shape the
+# frontend can hand straight to st.bar_chart. Keeping the two paths
+# separate means a change to one cannot ripple into the other.
+#
+# The "count" field on each value entry is a historical name — it holds
+# the bar's height, which is a row count for kind="count" charts and a
+# sum for kind="sum" charts. The frontend keys off "kind" and "metric"
+# to label the axis correctly.
+# ---------------------------------------------------------------------------
+
+def _column_is_chartable(
+    series: pd.Series,
+    min_distinct: int = 2,
+    max_distinct: int = 50,
+) -> bool:
+    non_null = series.dropna()
+    n = len(non_null)
+    if n == 0:
+        return False
+    n_unique = int(non_null.nunique())
+    if n_unique < min_distinct or n_unique > max_distinct:
+        return False
+    # A fully-unique column is an identifier, not a dimension — a bar
+    # chart of one-count bars is noise.
+    if n_unique == n:
+        return False
+    return True
+
+
+def _auto_pick_chart_column(df: pd.DataFrame) -> str | None:
+    """
+    Two-pass auto-pick. Pass 1 uses [2, 20] distinct values, pass 2
+    relaxes to [2, 50]. Within each pass, string/object columns are
+    preferred, then datetime, then numeric. First match wins — columns
+    are iterated in their natural DataFrame order within each pass.
+    """
+    predicates = (
+        lambda s: pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s),
+        lambda s: pd.api.types.is_datetime64_any_dtype(s),
+        lambda s: pd.api.types.is_numeric_dtype(s),
+    )
+    for max_distinct in (20, 50):
+        for predicate in predicates:
+            for col in df.columns:
+                series = df[col]
+                try:
+                    if not predicate(series):
+                        continue
+                except Exception:
+                    continue
+                if _column_is_chartable(series, 2, max_distinct):
+                    return col
+    return None
+
+
+def chart_data_for_column(
+    df: pd.DataFrame,
+    column: str | None = None,
+    top_n: int = 15,
+) -> dict | None:
+    """
+    Count-based chart: how often each value of `column` appears.
+
+    Returns a chart-ready breakdown for a single column, or None if no
+    suitable column exists. If `column` is provided, validated, and
+    chartable, use it. Otherwise fall back to an auto-picked column.
+
+    Return shape:
+        {"column": str, "metric": None, "kind": "count",
+         "values": [{"value": ..., "count": int}, ...], "truncated": bool}
+
+    Never raises — chart is presentation, and a broken chart must never
+    break the page it renders on.
+    """
+    try:
+        selected: str | None = None
+
+        if column is not None and column in df.columns:
+            if _column_is_chartable(df[column]):
+                selected = column
+
+        if selected is None:
+            selected = _auto_pick_chart_column(df)
+
+        if selected is None:
+            return None
+
+        try:
+            top_n = int(top_n)
+        except (TypeError, ValueError):
+            top_n = 15
+        top_n = max(1, top_n)
+
+        series = df[selected]
+        counts = series.value_counts(dropna=True)
+        truncated = len(counts) > top_n
+
+        values = [
+            {"value": _to_jsonable(v), "count": int(c)}
+            for v, c in counts.head(top_n).items()
+        ]
+
+        return {
+            "column": str(selected),
+            "metric": None,
+            "kind": "count",
+            "values": values,
+            "truncated": truncated,
+        }
+    except Exception:
+        return None
+
+
+def chart_data_for_metric(
+    df: pd.DataFrame,
+    group_column: str,
+    metric_column: str,
+    top_n: int = 15,
+) -> dict | None:
+    """
+    Sum-based chart: for each distinct value of `group_column`, sum
+    `metric_column`. E.g. sum of total_cases by state.
+
+    Returns None if the columns don't exist, the metric isn't numeric,
+    or the group column isn't chartable (too few / too many distinct
+    values, all-unique identifier, all nulls). Never raises.
+
+    Return shape:
+        {"column": str, "metric": str, "kind": "sum",
+         "values": [{"value": ..., "count": <sum>}, ...], "truncated": bool}
+    """
+    try:
+        if group_column not in df.columns:
+            return None
+        if metric_column not in df.columns:
+            return None
+
+        group_series = df[group_column]
+        metric_series = df[metric_column]
+
+        if not pd.api.types.is_numeric_dtype(metric_series):
+            return None
+
+        if not _column_is_chartable(group_series):
+            return None
+
+        try:
+            top_n = int(top_n)
+        except (TypeError, ValueError):
+            top_n = 15
+        top_n = max(1, top_n)
+
+        # dropna=True: a "None" bar on the x-axis is noise, not insight.
+        # pandas .sum() skips NaN in the metric by default, so groups
+        # with all-null metrics come back as 0.0 rather than NaN.
+        grouped = df.groupby(group_column, dropna=True)[metric_column].sum()
+        grouped = grouped.sort_values(ascending=False)
+        truncated = len(grouped) > top_n
+
+        values = [
+            {"value": _to_jsonable(g), "count": _to_jsonable(v)}
+            for g, v in grouped.head(top_n).items()
+        ]
+
+        return {
+            "column": str(group_column),
+            "metric": str(metric_column),
+            "kind": "sum",
+            "values": values,
+            "truncated": truncated,
+        }
+    except Exception:
+        return None
+
+
+def chart_data_for_overview(
+    df: pd.DataFrame,
+    primary_column: str | None = None,
+    primary_metric: str | None = None,
+    top_n: int = 15,
+) -> dict | None:
+    """
+    Dispatcher used by the /catalog/{id}/analyze and /reports/datasets/{id}/profile
+    endpoints to pick the right chart for a dataset overview.
+
+    Preference order:
+      1. Sum of primary_metric by primary_column — if both hints are set,
+         both columns exist, and the metric is numeric.
+      2. Count of rows per primary_column — the count-based fallback.
+      3. Auto-picked column, count of rows — when primary_column is null
+         or fails validation.
+
+    Returns None only when nothing in the DataFrame is chartable.
+    """
+    if primary_column and primary_metric and primary_column != primary_metric:
+        metric_chart = chart_data_for_metric(
+            df, primary_column, primary_metric, top_n=top_n
+        )
+        if metric_chart is not None:
+            return metric_chart
+    return chart_data_for_column(df, column=primary_column, top_n=top_n)
 
 
 # ---------------------------------------------------------------------------

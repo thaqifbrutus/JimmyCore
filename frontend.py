@@ -122,31 +122,80 @@ def render_failed_ai(label: str, reason: str):
     )
 
 
-def render_tool_call_provenance(call: dict):
+def _render_chart(chart_data: list[dict] | None, x_label: str | None = None,
+                  y_label: str | None = None):
     """
-    One tool call inside the provenance expander: name, arguments JSON,
-    result summary, and (when applicable) a small bar chart.
+    Render a small bar chart from a chart_data list of {key, value} dicts.
+
+    x_label / y_label are passed through to st.bar_chart so the axes are
+    labeled. Without them, the y-axis renders as bare numbers and the
+    x-axis as bare category names — fine if you already know what the
+    chart is showing, unreadable otherwise. st.bar_chart is backed by
+    Altair/Vega-Lite, which uses these as both the axis titles and the
+    tooltip field labels.
 
     The chart is a presentation bonus — a broken chart must not break the
-    chat turn, so the render is wrapped in try/except and silently skipped
-    on any failure. This is the one place in the codebase where silent
-    failure is acceptable.
+    page it renders on, so the whole thing is wrapped in try/except and
+    silently skipped on any failure. This is the one place in the codebase
+    where silent failure is acceptable, and it's on purpose.
     """
-    st.markdown(f"**`{call['name']}`**")
-    st.code(json.dumps(call.get("arguments", {}), indent=2), language="json")
-    st.caption(call.get("result_summary", "—"))
+    if not chart_data:
+        return
+    try:
+        import pandas as pd
+        chart_df = pd.DataFrame(chart_data).set_index(
+            list(chart_data[0].keys())[0]
+        )
+        st.bar_chart(chart_df, x_label=x_label, y_label=y_label)
+    except Exception:
+        pass  # charts are a bonus; never break the page over one
 
-    chart_data = call.get("chart_data")
+
+def _chart_axis_labels(tool_name: str | None, tool_args: dict | None,
+                       chart_data: list[dict] | None) -> tuple[str | None, str | None]:
+    """
+    Derive human-readable x/y axis labels from a chat tool call's name and
+    arguments. Used only for chat charts (which come from tool responses
+    where we know exactly which tool produced them). The overview chart
+    uses the kind/metric fields on the chart dict directly.
+    """
+    args = tool_args or {}
+    if tool_name == "value_counts":
+        return args.get("column"), "count"
+    if tool_name == "aggregate":
+        group = args.get("group_by")
+        agg_col = args.get("agg_column")
+        agg_func = args.get("agg_func")
+        if agg_col and agg_func:
+            return group, f"{agg_func} of {agg_col}"
+        return group, agg_func or agg_col
+    # Unknown tool — pull labels from the data keys as a last resort.
     if chart_data:
-        try:
-            import pandas as pd
-            chart_df = pd.DataFrame(chart_data).set_index(
-                list(chart_data[0].keys())[0]
-            )
-            st.bar_chart(chart_df)
-        except Exception:
-            # Charts are a bonus. Never break the answer over one.
-            pass
+        keys = list(chart_data[0].keys())
+        if len(keys) >= 2:
+            return keys[0], keys[1]
+    return None, None
+
+
+def _render_tool_calls_button(tool_calls: list):
+    """
+    Renders the tool-call trail behind a single discreet icon button.
+    Hidden unless the user explicitly opens it — the answer and its chart
+    are the visible output; the tool trail is for verification.
+
+    Uses st.popover (Streamlit >= 1.31). AppTest element accessibility for
+    popovers varies across Streamlit versions, so the test that asserts
+    this button exists checks the underlying data rather than the widget.
+    """
+    if not tool_calls:
+        return
+    with st.popover(f"⚙️ Tool calls ({len(tool_calls)})"):
+        for i, call in enumerate(tool_calls, 1):
+            if i > 1:
+                st.markdown("---")
+            st.markdown(f"**{i}. `{call['name']}`**")
+            st.code(json.dumps(call.get("arguments", {}), indent=2), language="json")
+            st.caption(call.get("result_summary", "—"))
 
 
 # ── Session state initialisation ───────────────────────────────────────────
@@ -199,7 +248,7 @@ def _do_ask(question: str):
     st.session_state.messages, and updates chat_history on success.
 
     The assistant message carries tool_calls from the response so the
-    render loop can show the "How I got this answer" expander.
+    render loop can show the inline chart and the tool-calls popover.
     """
     st.session_state.messages.append({"role": "user", "content": question})
 
@@ -331,7 +380,7 @@ elif st.session_state.input_mode == "Upload a CSV" and not st.session_state.prof
 st.divider()
 
 
-# ── Step 2: detail view — overview + suggested questions + chat ────────────
+# ── Step 2: detail view — overview + chart + suggested questions + chat ────
 # Shared by both flows — /reports/datasets/{id}/profile (upload) and
 # /catalog/{id}/analyze (search) return the same shape, so everything
 # below renders identically regardless of where the data came from.
@@ -361,6 +410,35 @@ if st.session_state.profile_result:
         render_failed_ai("Overview", overview_error)
     elif isinstance(overview_content, dict):
         st.markdown(overview_content.get("overview", ""))
+
+        # Overview chart — sits between the prose and the suggested
+        # questions below. Never inside an expander: this is part of the
+        # answer, not metadata about it. Axis labels and caption branch
+        # on the chart's "kind" — sum-based charts (from the model's
+        # primary_metric hint) read "sum of X by Y", count-based charts
+        # read "count of X".
+        chart = overview_raw.get("chart") if isinstance(overview_raw, dict) else None
+        if chart and chart.get("values"):
+            chart_kind = chart.get("kind", "count")
+            chart_metric = chart.get("metric")
+            if chart_kind == "sum" and chart_metric:
+                y_label = f"sum of {chart_metric}"
+                chart_caption = (
+                    f"Top {len(chart['values'])} `{chart['column']}` "
+                    f"by `{chart_metric}`"
+                )
+            else:
+                y_label = "count"
+                chart_caption = (
+                    f"Top {len(chart['values'])} values of `{chart['column']}`"
+                )
+            _render_chart(
+                [{"value": v["value"], "count": v["count"]} for v in chart["values"]],
+                x_label=chart.get("column"),
+                y_label=y_label,
+            )
+            st.caption(chart_caption)
+
         st.session_state.suggested_questions = (
             overview_content.get("suggested_questions", []) or []
         )
@@ -383,16 +461,31 @@ if st.session_state.profile_result:
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            if msg["role"] == "assistant" and msg.get("tool_calls"):
-                tool_calls = msg["tool_calls"]
-                with st.expander(
-                    f"🔍 How I got this answer ({len(tool_calls)} tool call(s))"
-                ):
-                    for i, call in enumerate(tool_calls, 1):
-                        if i > 1:
-                            st.markdown("---")
-                        st.markdown(f"**{i}.**")
-                        render_tool_call_provenance(call)
+
+            if msg["role"] == "assistant":
+                # Inline chart from the most recent tool call that has one.
+                # Shown directly, not in an expander — the answer and its
+                # visualization belong together. Reverse-iterate so the
+                # latest chartable call wins when a message has multiple.
+                chart_call = None
+                for call in reversed(msg.get("tool_calls", []) or []):
+                    if call.get("chart_data"):
+                        chart_call = call
+                        break
+                if chart_call:
+                    x_label, y_label = _chart_axis_labels(
+                        chart_call.get("name"),
+                        chart_call.get("arguments"),
+                        chart_call.get("chart_data"),
+                    )
+                    _render_chart(
+                        chart_call["chart_data"],
+                        x_label=x_label,
+                        y_label=y_label,
+                    )
+
+                # Demoted tool-call trail — single discreet icon button.
+                _render_tool_calls_button(msg.get("tool_calls", []) or [])
 
     if prompt := st.chat_input("Ask a question about this dataset..."):
         with st.spinner("Thinking..."):

@@ -88,20 +88,16 @@ def test_value_counts_groups_correctly(df):
     values = {v["value"]: v for v in result["values"]}
     assert values["Selangor"]["count"] == 2
     assert values["Johor"]["count"] == 2
-    # Fixture has 5 non-null state rows; Selangor and Johor each appear
-    # twice → 2/5 * 100 = 40.0. Penang once → 20.0.
     assert values["Selangor"]["share"] == 40.0
     assert values["Johor"]["share"] == 40.0
     assert values["Penang"]["share"] == 20.0
 
 
 def test_value_counts_includes_share(df):
-    """A4: every entry carries a share field (percentage of non-null rows)."""
     result = data_tools.value_counts(df, "state", top_n=10)
     for entry in result["values"]:
         assert "share" in entry
         assert isinstance(entry["share"], float)
-    # Shares of non-null rows should sum to ~100 (float rounding aside).
     total_share = sum(e["share"] for e in result["values"])
     assert total_share == pytest.approx(100.0, abs=0.1)
 
@@ -115,7 +111,6 @@ def test_value_counts_truncation_flag():
 
 def test_value_counts_top_n_capped_at_50(df):
     result = data_tools.value_counts(df, "state", top_n=500)
-    # Cap is 50 but only 3 unique — all 3 returned.
     assert len(result["values"]) == 3
 
 
@@ -149,8 +144,6 @@ def test_filter_rows_not_equal(df):
 
 
 def test_filter_rows_contains_case_insensitive(df):
-    # "JO" matches Johor twice (case-insensitive); Selangor does not
-    # contain "jo", so it should not match.
     result = data_tools.filter_rows(df, "state", "contains", "JO")
     assert result["matched"] == 2
 
@@ -161,6 +154,14 @@ def test_filter_rows_truncation():
     assert result["matched"] == 100
     assert result["returned"] == 10
     assert result["truncated"] is True
+
+
+def test_filter_rows_truncated_response_includes_guidance():
+    big = pd.DataFrame({"x": list(range(100))})
+    result = data_tools.filter_rows(big, "x", ">=", 0, limit=10)
+    assert result["truncated"] is True
+    assert "guidance" in result
+    assert "aggregate" in result["guidance"]
 
 
 def test_filter_rows_invalid_operator(df):
@@ -199,11 +200,8 @@ def test_aggregate_count(df):
 
 
 def test_aggregate_count_includes_share(df):
-    """A4: agg_func='count' results carry share (percentage of total count)."""
     result = data_tools.aggregate(df, "state", "accidents", "count")
     by_group = {r["group"]: r for r in result["results"]}
-    # 6 total rows (dropna=False: the None state is its own group with
-    # count 1). Selangor has count 2 → 2/6 * 100 = 33.33.
     assert by_group["Selangor"]["value"] == 2
     assert by_group["Selangor"]["share"] == 33.33
     for entry in result["results"]:
@@ -211,7 +209,6 @@ def test_aggregate_count_includes_share(df):
 
 
 def test_aggregate_sum_does_not_include_share(df):
-    """A4 regression guard: share is only meaningful for count."""
     result = data_tools.aggregate(df, "state", "accidents", "sum")
     for entry in result["results"]:
         assert "share" not in entry
@@ -250,3 +247,188 @@ def test_schemas_have_valid_shape():
         fn = s["function"]
         assert "name" in fn and "description" in fn and "parameters" in fn
         assert fn["parameters"]["type"] == "object"
+
+
+# ── chart_data_for_column (Round B) ─────────────────────────────────────────
+
+def test_chart_data_uses_explicit_column_when_valid():
+    df = pd.DataFrame({
+        "state": ["A", "B", "A", "C", "B", "A"],
+        "value": [1, 2, 3, 4, 5, 6],
+    })
+    result = data_tools.chart_data_for_column(df, column="state")
+    assert result is not None
+    assert result["column"] == "state"
+    assert result["kind"] == "count"
+    assert result["metric"] is None
+    values = {v["value"]: v["count"] for v in result["values"]}
+    assert values["A"] == 3
+    assert values["B"] == 2
+    assert values["C"] == 1
+    assert result["truncated"] is False
+
+
+def test_chart_data_rejects_high_cardinality_explicit_column():
+    df = pd.DataFrame({
+        "id": [f"ID-{i}" for i in range(100)],
+        "category": ["x", "y"] * 50,
+    })
+    result = data_tools.chart_data_for_column(df, column="id")
+    assert result is not None
+    assert result["column"] == "category"
+
+
+def test_chart_data_auto_picks_categorical_column():
+    df = pd.DataFrame({
+        "value": [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5],
+        "state": ["A", "B", "A", "C", "B", "A", "B", "C", "A", "B"],
+    })
+    result = data_tools.chart_data_for_column(df)
+    assert result is not None
+    assert result["column"] == "state"
+
+
+def test_chart_data_returns_none_when_no_chartable_column():
+    df = pd.DataFrame({
+        "a": [f"ID-{i}" for i in range(100)],
+        "b": list(range(100, 200)),
+        "c": [i * 1.5 for i in range(100)],
+    })
+    assert data_tools.chart_data_for_column(df) is None
+
+
+def test_chart_data_top_n_caps_values():
+    df = pd.DataFrame({
+        "cat": [f"v{i}" for i in range(30)] * 2,
+    })
+    result = data_tools.chart_data_for_column(df, column="cat", top_n=10)
+    assert result is not None
+    assert len(result["values"]) == 10
+    assert result["truncated"] is True
+
+
+def test_chart_data_values_are_json_serializable():
+    df = pd.DataFrame({"state": ["A", "B", "A"]})
+    result = data_tools.chart_data_for_column(df, column="state")
+    assert result is not None
+    json.dumps(result)
+
+
+# ── chart_data_for_metric ──────────────────────────────────────────────────
+
+def test_chart_data_for_metric_sums_numeric_by_group():
+    df = pd.DataFrame({
+        "state": ["Selangor", "Johor", "Selangor", "Penang", "Johor"],
+        "cases": [100, 50, 30, 20, 70],
+    })
+    result = data_tools.chart_data_for_metric(df, "state", "cases")
+    assert result is not None
+    assert result["column"] == "state"
+    assert result["metric"] == "cases"
+    assert result["kind"] == "sum"
+    values = {v["value"]: v["count"] for v in result["values"]}
+    assert values["Selangor"] == 130
+    assert values["Johor"] == 120
+    assert values["Penang"] == 20
+    # Sorted descending by sum.
+    assert result["values"][0]["value"] == "Selangor"
+
+
+def test_chart_data_for_metric_rejects_non_numeric_metric():
+    df = pd.DataFrame({
+        "state": ["A", "B", "A"],
+        "label": ["x", "y", "z"],
+    })
+    assert data_tools.chart_data_for_metric(df, "state", "label") is None
+
+
+def test_chart_data_for_metric_rejects_unknown_columns():
+    df = pd.DataFrame({"state": ["A", "B"], "cases": [1, 2]})
+    assert data_tools.chart_data_for_metric(df, "nope", "cases") is None
+    assert data_tools.chart_data_for_metric(df, "state", "nope") is None
+
+
+def test_chart_data_for_metric_rejects_high_cardinality_group():
+    df = pd.DataFrame({
+        "id": [f"ID-{i}" for i in range(100)],
+        "cases": list(range(100)),
+    })
+    # `id` is all-unique → not a dimension.
+    assert data_tools.chart_data_for_metric(df, "id", "cases") is None
+
+
+def test_chart_data_for_metric_truncates_to_top_n():
+    df = pd.DataFrame({
+        "cat": [f"c{i}" for i in range(30)] * 2,
+        "val": list(range(60)),
+    })
+    result = data_tools.chart_data_for_metric(df, "cat", "val", top_n=10)
+    assert result is not None
+    assert len(result["values"]) == 10
+    assert result["truncated"] is True
+
+
+# ── chart_data_for_overview dispatcher ─────────────────────────────────────
+
+def test_chart_data_for_overview_uses_metric_when_both_provided():
+    df = pd.DataFrame({
+        "state": ["Selangor", "Johor", "Selangor", "Penang"],
+        "cases": [100, 50, 30, 20],
+    })
+    result = data_tools.chart_data_for_overview(
+        df, primary_column="state", primary_metric="cases"
+    )
+    assert result is not None
+    assert result["kind"] == "sum"
+    assert result["metric"] == "cases"
+    assert result["column"] == "state"
+
+
+def test_chart_data_for_overview_falls_back_when_metric_invalid():
+    df = pd.DataFrame({
+        "state": ["Selangor", "Johor", "Selangor", "Penang"],
+        "label": ["x", "y", "z", "w"],  # non-numeric
+    })
+    result = data_tools.chart_data_for_overview(
+        df, primary_column="state", primary_metric="label"
+    )
+    assert result is not None
+    # Fell back to count-based on the same column.
+    assert result["kind"] == "count"
+    assert result["column"] == "state"
+
+
+def test_chart_data_for_overview_falls_back_when_metric_none():
+    df = pd.DataFrame({
+        "state": ["Selangor", "Johor", "Selangor"],
+        "cases": [100, 50, 30],
+    })
+    result = data_tools.chart_data_for_overview(
+        df, primary_column="state", primary_metric=None
+    )
+    assert result is not None
+    assert result["kind"] == "count"
+
+
+def test_chart_data_for_overview_rejects_self_referential_metric():
+    """primary_column == primary_metric is nonsensical — must fall back."""
+    df = pd.DataFrame({
+        "state": ["Selangor", "Johor", "Selangor"],
+    })
+    result = data_tools.chart_data_for_overview(
+        df, primary_column="state", primary_metric="state"
+    )
+    assert result is not None
+    assert result["kind"] == "count"
+
+
+def test_chart_data_for_overview_auto_picks_when_both_none():
+    df = pd.DataFrame({
+        "state": ["Selangor", "Johor", "Selangor"],
+        "cases": [100, 50, 30],
+    })
+    result = data_tools.chart_data_for_overview(df)
+    assert result is not None
+    # Auto-pick lands on the string column.
+    assert result["column"] == "state"
+    assert result["kind"] == "count"

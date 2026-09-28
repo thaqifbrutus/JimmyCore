@@ -1,11 +1,16 @@
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
+import os
+import json
+
+import pandas as pd
+
 from db.database import get_db
 from app.models.dataset import Dataset
 from app.models.report import QualityReport
 from app.models.catalog_dataset import CatalogDataset
 from app.models.audit_log import AuditLog
-from app.services import data_loader
+from app.services import data_loader, data_tools
 from app.services.profiler import profile_dataset
 from app.services.report_builder import persist_report
 from app.services.ai_service import (
@@ -13,8 +18,6 @@ from app.services.ai_service import (
     answer_dataset_question,
 )
 from pydantic import BaseModel
-import os
-import json
 
 
 class QuestionRequest(BaseModel):
@@ -32,8 +35,8 @@ def _resolve_source_name(dataset: Dataset | None, catalog_dataset: CatalogDatase
     A report's "original filename" for AI-prompt purposes now has two
     possible sources — an uploaded file's original_name, or a government
     catalog dataset's title_en — since QualityReport is shared across both
-    flows (see app/models/report.py's docstring). Pure function, no DB
-    access, so it's directly unit-testable without a database at all.
+    flows. Pure function, no DB access, so it's directly unit-testable
+    without a database at all.
     """
     if dataset is not None:
         return dataset.original_name
@@ -86,6 +89,23 @@ def trigger_profile(
             profile_data=profile,
             original_filename=dataset.original_name,
         )
+
+        # Attach a chart to the overview, matching the catalog flow's
+        # response shape. Chart is presentation — if the file can't be
+        # re-read for charting, the overview just ships without a chart
+        # rather than failing the whole profile request.
+        if overview.get("status") == "ok" and isinstance(overview.get("content"), dict):
+            try:
+                chart_df = pd.read_csv(file_path)
+                primary = overview["content"].get("primary_column")
+                metric = overview["content"].get("primary_metric")
+                overview["chart"] = data_tools.chart_data_for_overview(
+                    chart_df, primary_column=primary, primary_metric=metric
+                )
+            except Exception:
+                overview["chart"] = None
+        else:
+            overview["chart"] = None
 
         dataset.row_count = profile["overview"]["row_count"]
         dataset.column_count = profile["overview"]["column_count"]

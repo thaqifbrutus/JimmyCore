@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends, Query
 from sqlalchemy.orm import Session
 from db.database import get_db
 from app.models.catalog_dataset import CatalogDataset
+from app.services import data_tools
 from app.services.catalog_sync import sync_catalog
 from app.services.catalog_search import generate_catalog_embeddings, search_catalog
 from app.services.gov_data_client import get_dataset_dataframe, GovAPIError
@@ -74,15 +75,12 @@ def analyze_catalog_dataset(
     """
     Given a dataset id (found via /catalog/search), fetches its real data
     (cached or live), profiles it, generates an AI overview plus suggested
-    starter questions, and persists a QualityReport — the same shape as
-    the upload flow, so every existing /reports/{id} endpoint works on
-    the result unchanged.
+    starter questions plus a chart, and persists a QualityReport.
 
     The profile's "source" field (see build_source_context in
     ai_service.py) tells the model this is an official government dataset
     rather than a user upload, so it cites the source agency and sticks to
-    summarizing rather than interpreting — see SYSTEM_PROMPT for why that
-    distinction matters here specifically.
+    summarizing rather than interpreting.
     """
     catalog_dataset = (
         db.query(CatalogDataset).filter(CatalogDataset.id == catalog_dataset_id).first()
@@ -113,6 +111,21 @@ def analyze_catalog_dataset(
             profile_data=profile,
             original_filename=catalog_dataset.title_en,
         )
+
+        # Attach a chart for the overview, based on the model's
+        # primary_column + primary_metric hints. When both are set and
+        # valid, this produces a sum-based chart ("sum of total_cases by
+        # state"); otherwise it falls back to a count-based chart. The
+        # chart lives on the overview dict so it survives the /reports/{id}
+        # round-trip (ai_summary is where the overview is persisted).
+        if overview.get("status") == "ok" and isinstance(overview.get("content"), dict):
+            primary = overview["content"].get("primary_column")
+            metric = overview["content"].get("primary_metric")
+            overview["chart"] = data_tools.chart_data_for_overview(
+                df, primary_column=primary, primary_metric=metric
+            )
+        else:
+            overview["chart"] = None
 
         report = persist_report(
             db, profile, overview,
