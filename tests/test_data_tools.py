@@ -85,9 +85,25 @@ def test_value_counts_groups_correctly(df):
     result = data_tools.value_counts(df, "state", top_n=10)
     assert result["unique_count"] == 3
     assert result["truncated"] is False
-    values = {v["value"]: v["count"] for v in result["values"]}
-    assert values["Selangor"] == 2
-    assert values["Johor"] == 2
+    values = {v["value"]: v for v in result["values"]}
+    assert values["Selangor"]["count"] == 2
+    assert values["Johor"]["count"] == 2
+    # Fixture has 5 non-null state rows; Selangor and Johor each appear
+    # twice → 2/5 * 100 = 40.0. Penang once → 20.0.
+    assert values["Selangor"]["share"] == 40.0
+    assert values["Johor"]["share"] == 40.0
+    assert values["Penang"]["share"] == 20.0
+
+
+def test_value_counts_includes_share(df):
+    """A4: every entry carries a share field (percentage of non-null rows)."""
+    result = data_tools.value_counts(df, "state", top_n=10)
+    for entry in result["values"]:
+        assert "share" in entry
+        assert isinstance(entry["share"], float)
+    # Shares of non-null rows should sum to ~100 (float rounding aside).
+    total_share = sum(e["share"] for e in result["values"])
+    assert total_share == pytest.approx(100.0, abs=0.1)
 
 
 def test_value_counts_truncation_flag():
@@ -182,10 +198,31 @@ def test_aggregate_count(df):
     assert values["Selangor"] == 2
 
 
+def test_aggregate_count_includes_share(df):
+    """A4: agg_func='count' results carry share (percentage of total count)."""
+    result = data_tools.aggregate(df, "state", "accidents", "count")
+    by_group = {r["group"]: r for r in result["results"]}
+    # 6 total rows (dropna=False: the None state is its own group with
+    # count 1). Selangor has count 2 → 2/6 * 100 = 33.33.
+    assert by_group["Selangor"]["value"] == 2
+    assert by_group["Selangor"]["share"] == 33.33
+    for entry in result["results"]:
+        assert "share" in entry
+
+
+def test_aggregate_sum_does_not_include_share(df):
+    """A4 regression guard: share is only meaningful for count."""
+    result = data_tools.aggregate(df, "state", "accidents", "sum")
+    for entry in result["results"]:
+        assert "share" not in entry
+
+
 def test_aggregate_min_max_median_run(df):
     for fn in ("min", "max", "median"):
         result = data_tools.aggregate(df, "state", "accidents", fn)
         assert "error" not in result
+        for entry in result["results"]:
+            assert "share" not in entry
 
 
 def test_aggregate_invalid_func(df):

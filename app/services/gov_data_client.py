@@ -33,11 +33,12 @@ BASE_URL = "https://api.data.gov.my/data-catalogue"
 MAX_REQUESTS_PER_MINUTE = 4
 
 # No pagination exists on this API — `limit` is the only size control,
-# and an unset limit appears to return everything. Defaulting to a cap
-# rather than unbounded, so a popular high-frequency dataset (e.g. daily
-# fuel prices going back years) doesn't pull an unexpectedly huge payload
-# on a casual search-driven fetch. Callers can override.
-DEFAULT_FETCH_LIMIT = 1000
+# and an unset limit appears to return everything. 5000 is a pragmatic
+# ceiling: larger than 99% of data.gov.my datasets, small enough to stay
+# within memory/timeout limits. When the fetch returns exactly this many
+# rows, the DataFrame is tagged may_be_truncated=True so the tool-runner
+# can warn the model (and thus the user) that the view may be partial.
+DEFAULT_FETCH_LIMIT = 5000
 
 DEFAULT_CACHE_MAX_AGE_MINUTES = 60
 
@@ -146,6 +147,22 @@ def _is_fresh(cache_row: GovDataCache, max_age_minutes: int) -> bool:
     return datetime.utcnow() - cache_row.fetched_at < timedelta(minutes=max_age_minutes)
 
 
+def _tag_dataframe(df: pd.DataFrame, limit: int) -> pd.DataFrame:
+    """
+    Tag the DataFrame with fetch-provenance metadata. Used by the
+    tool-runner to warn the model when its view of the data may be
+    partial (the fetch hit the limit exactly).
+
+    Using pd.DataFrame.attrs, which survives most pandas operations but
+    not all — the tag only needs to survive from here to the system-prompt
+    construction in tool_runner.run_tool_loop, which happens before any
+    filtering.
+    """
+    df.attrs["fetch_limit"] = limit
+    df.attrs["may_be_truncated"] = len(df) >= limit
+    return df
+
+
 def get_dataset_dataframe(
     db: Session,
     dataset_id: str,
@@ -157,12 +174,15 @@ def get_dataset_dataframe(
     Main entry point. Returns a DataFrame of the dataset's rows, using a
     cached copy if one exists and is still fresh, otherwise fetching live
     (respecting the rate limiter) and updating the cache.
+
+    Both return paths go through _tag_dataframe so callers can rely on
+    df.attrs["may_be_truncated"] being present.
     """
     cache_row = _get_cache_row(db, dataset_id)
 
     if cache_row is not None and not force_refresh and _is_fresh(cache_row, max_age_minutes):
         rows = json.loads(cache_row.raw_data)
-        return pd.DataFrame(rows)
+        return _tag_dataframe(pd.DataFrame(rows), limit)
 
     rows = fetch_dataset_from_api(dataset_id, limit=limit)
 
@@ -174,4 +194,4 @@ def get_dataset_dataframe(
     ))
     db.commit()
 
-    return pd.DataFrame(rows)
+    return _tag_dataframe(pd.DataFrame(rows), limit)

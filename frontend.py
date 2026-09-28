@@ -82,16 +82,27 @@ def ask_question(report_id, question, history):
 # AI functions return {"status": "ok"|"failed", "reason": ..., "content": ...}.
 # extract_ai_content pulls .content out safely and surfaces failures.
 
+_QUOTA_EXHAUSTED_MESSAGE = (
+    "AI quota exhausted for today. Jimmy will be back after the free-tier "
+    "daily reset (midnight UTC)."
+)
+
+
 def extract_ai_content(result_dict, field_name="content"):
     """
     Pulls .content out of a structured AI result dict.
     Returns (content, error_message) — one is always None.
+
+    Special-cases the daily-quota error so the user sees an explanatory
+    message rather than the raw OpenRouter 429 payload.
     """
     if result_dict is None:
         return None, "No response received from the API."
     if isinstance(result_dict, str):
         # Old-shape response from an endpoint not yet updated — pass through.
         return result_dict, None
+    if result_dict.get("error_type") == "daily_quota_exhausted":
+        return None, _QUOTA_EXHAUSTED_MESSAGE
     status = result_dict.get("status")
     if status == "ok":
         return result_dict.get(field_name), None
@@ -106,10 +117,36 @@ def render_failed_ai(label: str, reason: str):
     """Consistent UI treatment for a failed AI result."""
     st.warning(
         f"⚠️ **{label} could not be generated.**\n\n"
-        f"Reason: {reason}\n\n"
-        f"Try clicking Regenerate, or upload a different file.",
+        f"Reason: {reason}",
         icon=None
     )
+
+
+def render_tool_call_provenance(call: dict):
+    """
+    One tool call inside the provenance expander: name, arguments JSON,
+    result summary, and (when applicable) a small bar chart.
+
+    The chart is a presentation bonus — a broken chart must not break the
+    chat turn, so the render is wrapped in try/except and silently skipped
+    on any failure. This is the one place in the codebase where silent
+    failure is acceptable.
+    """
+    st.markdown(f"**`{call['name']}`**")
+    st.code(json.dumps(call.get("arguments", {}), indent=2), language="json")
+    st.caption(call.get("result_summary", "—"))
+
+    chart_data = call.get("chart_data")
+    if chart_data:
+        try:
+            import pandas as pd
+            chart_df = pd.DataFrame(chart_data).set_index(
+                list(chart_data[0].keys())[0]
+            )
+            st.bar_chart(chart_df)
+        except Exception:
+            # Charts are a bonus. Never break the answer over one.
+            pass
 
 
 # ── Session state initialisation ───────────────────────────────────────────
@@ -160,6 +197,9 @@ def _do_ask(question: str):
     """
     Submits one question to /ask, appends user + assistant turns to
     st.session_state.messages, and updates chat_history on success.
+
+    The assistant message carries tool_calls from the response so the
+    render loop can show the "How I got this answer" expander.
     """
     st.session_state.messages.append({"role": "user", "content": question})
 
@@ -169,6 +209,7 @@ def _do_ask(question: str):
 
     answer_raw = response.get("answer") if response else None
     answer_content, answer_error = extract_ai_content(answer_raw)
+    tool_log = (response or {}).get("tool_calls_log", []) or []
 
     if answer_error:
         content = f"⚠️ {answer_error}"
@@ -179,7 +220,11 @@ def _do_ask(question: str):
     else:
         content = "⚠️ No response from the API."
 
-    st.session_state.messages.append({"role": "assistant", "content": content})
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": content,
+        "tool_calls": tool_log,
+    })
 
 
 # ── Step 1: choose input method ────────────────────────────────────────────
@@ -338,6 +383,16 @@ if st.session_state.profile_result:
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+            if msg["role"] == "assistant" and msg.get("tool_calls"):
+                tool_calls = msg["tool_calls"]
+                with st.expander(
+                    f"🔍 How I got this answer ({len(tool_calls)} tool call(s))"
+                ):
+                    for i, call in enumerate(tool_calls, 1):
+                        if i > 1:
+                            st.markdown("---")
+                        st.markdown(f"**{i}.**")
+                        render_tool_call_provenance(call)
 
     if prompt := st.chat_input("Ask a question about this dataset..."):
         with st.spinner("Thinking..."):

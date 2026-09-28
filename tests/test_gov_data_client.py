@@ -247,3 +247,56 @@ def test_handles_empty_result_set(db_session, monkeypatch):
 
     assert isinstance(df, pd.DataFrame)
     assert len(df) == 0
+
+
+# ---------------------------------------------------------------------------
+# A2: truncation tagging on the returned DataFrame
+# ---------------------------------------------------------------------------
+
+def test_fetch_tags_dataframe_as_may_be_truncated_when_full(db_session, monkeypatch):
+    """Fetch returns exactly `limit` rows — flag it so tool_runner can warn."""
+    def fake_fetch(dataset_id, limit):
+        return [{"x": i} for i in range(limit)]
+
+    monkeypatch.setattr(gov_data_client, "fetch_dataset_from_api", fake_fetch)
+
+    df = get_dataset_dataframe(db_session, "fuelprice", limit=50)
+
+    assert df.attrs.get("may_be_truncated") is True
+    assert df.attrs.get("fetch_limit") == 50
+    assert len(df) == 50
+
+
+def test_fetch_tags_dataframe_as_not_truncated_when_partial(db_session, monkeypatch):
+    """Fetch returns fewer rows than the limit — no truncation flag."""
+    def fake_fetch(dataset_id, limit):
+        return [{"x": i} for i in range(10)]
+
+    monkeypatch.setattr(gov_data_client, "fetch_dataset_from_api", fake_fetch)
+
+    df = get_dataset_dataframe(db_session, "fuelprice", limit=50)
+
+    assert df.attrs.get("may_be_truncated") is False
+    assert df.attrs.get("fetch_limit") == 50
+    assert len(df) == 10
+
+
+def test_cache_hit_path_also_tags_the_dataframe(db_session, monkeypatch):
+    """The cache-hit branch must set the same attrs as the fetch branch."""
+    db_session.add(GovDataCache(
+        catalog_dataset_id="fuelprice",
+        raw_data=json.dumps([{"x": i} for i in range(50)]),
+        row_count=50,
+        fetched_at=datetime.utcnow(),
+    ))
+    db_session.commit()
+
+    def _should_not_be_called(*a, **kw):
+        raise AssertionError("fetch should not fire for a fresh cache")
+
+    monkeypatch.setattr(gov_data_client, "fetch_dataset_from_api", _should_not_be_called)
+
+    df = get_dataset_dataframe(db_session, "fuelprice", limit=50)
+
+    assert df.attrs.get("may_be_truncated") is True
+    assert df.attrs.get("fetch_limit") == 50

@@ -37,10 +37,23 @@ Tool use:
   call filter_rows and report the actual count.
 - When a tool returns truncated: true, tell the user the result was capped
   and offer to narrow the query.
-- If a tool errors, read the error, adjust your arguments, and try again.
+- Once you have the information needed to answer, STOP calling tools and
+  write the answer. Do not keep calling tools just to be thorough. A
+  single good aggregate is usually enough to answer a "which / how many /
+  top N" question — you don't need to also filter the underlying rows.
+
+When a tool errors:
+- If the error says you already called that tool with those arguments:
+  DO NOT call it again. You already have that result. This is a signal
+  to STOP, not to retry. Either use what you have already gathered to
+  answer the question, or call a genuinely DIFFERENT tool with DIFFERENT
+  arguments. If neither is needed, answer with what you have.
+- For any other error (unknown column, invalid operator, wrong value
+  type), read the error message, fix your arguments, and try once more.
   Do not give up after one failure.
-- When you cannot answer: if the data doesn't contain what's needed, say
-  so plainly. Do not fabricate. Offer what you can answer.
+
+When you cannot answer: if the data doesn't contain what's needed, say
+so plainly. Do not fabricate. Offer what you can answer.
 
 Tone: professional, conversational, precise. Write for mixed audiences —
 developers, analysts, project managers. Avoid jargon where possible.
@@ -116,6 +129,25 @@ def _is_structured_output_unsupported_error(exc: Exception) -> bool:
     return mentions_response_format and mentions_unsupported
 
 
+def _is_daily_quota_error(exc: Exception) -> bool:
+    """
+    True when OpenRouter reports the account-wide free-tier daily limit is
+    exhausted. This is a per-ACCOUNT budget shared by every free model, so
+    when it fires, no fallback model has any chance of succeeding — the
+    only correct response is to stop walking the chain and surface the
+    error to the user.
+
+    Matched by inspecting the error text because OpenRouter surfaces this
+    as a 429 with a limit_source field; there's no dedicated exception
+    class from the OpenAI SDK for it.
+    """
+    text = str(exc).lower()
+    return (
+        "429" in text
+        and ("free-models-per-day" in text or "openrouter_free_tier_daily" in text)
+    )
+
+
 def _call_ai_model(
     messages: list,
     context_label: str,
@@ -147,6 +179,18 @@ def _call_ai_model(
             response = client.chat.completions.create(**kwargs)
 
         except Exception as exc:
+            # Daily quota exhaustion is account-wide: no fallback can help.
+            # Break immediately instead of walking the chain (~15s of
+            # guaranteed-fail calls + per-model log noise).
+            if _is_daily_quota_error(exc):
+                print(
+                    "WARNING: OpenRouter daily quota exhausted — "
+                    "aborting model chain."
+                )
+                last_error = str(exc)
+                last_error_type = "daily_quota_exhausted"
+                break
+
             error_type = None
             if response_format is not None and _is_structured_output_unsupported_error(exc):
                 error_type = "structured_output_unsupported"
@@ -372,7 +416,7 @@ def generate_dataset_overview(profile_data: dict, original_filename: str) -> dic
 
 
 # ---------------------------------------------------------------------------
-# Q&A — now tool-driven. Delegates the loop to tool_runner, which owns the
+# Q&A — tool-driven. Delegates the loop to tool_runner, which owns the
 # model chain, iteration cap, and context-mode fallback.
 # ---------------------------------------------------------------------------
 
@@ -385,7 +429,7 @@ def answer_dataset_question(
 ) -> dict:
     """
     Delegates to tool_runner.run_tool_loop. Returns
-    {"status", "content", "reason", "tool_calls_log"}.
+    {"status", "content", "reason", "error_type", "tool_calls_log"}.
 
     Local import of tool_runner to avoid a module-level import cycle
     (tool_runner imports from this module).

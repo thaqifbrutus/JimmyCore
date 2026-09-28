@@ -170,7 +170,14 @@ def describe_column(df: pd.DataFrame, column: str) -> dict:
 
 
 def value_counts(df: pd.DataFrame, column: str, top_n: int = 10) -> dict:
-    """Frequency counts for one column. top_n capped at 50."""
+    """
+    Frequency counts for one column. top_n capped at 50.
+
+    Each value includes a 'share' field — the percentage of non-null rows
+    that hold that value, rounded to 2 decimals. This exists so the model
+    doesn't have to do the percentage arithmetic itself (and can't
+    hallucinate it).
+    """
     try:
         if column not in df.columns:
             return _column_error(df, column)
@@ -185,12 +192,21 @@ def value_counts(df: pd.DataFrame, column: str, top_n: int = 10) -> dict:
         vc = series.value_counts(dropna=True)
         truncated = len(vc) > top_n
 
+        total_non_null = int(series.notna().sum())
+
+        values = []
+        for v, c in vc.head(top_n).items():
+            count = int(c)
+            share = round(count / total_non_null * 100, 2) if total_non_null else 0.0
+            values.append({
+                "value": _to_jsonable(v),
+                "count": count,
+                "share": share,
+            })
+
         return {
             "column": str(column),
-            "values": [
-                {"value": _to_jsonable(v), "count": int(c)}
-                for v, c in vc.head(top_n).items()
-            ],
+            "values": values,
             "truncated": truncated,
             "unique_count": unique_count,
         }
@@ -259,12 +275,29 @@ def filter_rows(df: pd.DataFrame, column: str, operator: str, value: Any, limit:
         filtered = df[mask].head(limit)
         returned = int(filtered.shape[0])
 
-        return {
+        result = {
             "rows": _to_records(filtered),
             "matched": matched,
             "returned": returned,
             "truncated": matched > limit,
         }
+        if matched > limit:
+            # Direct guidance for the model — the raw `truncated: true` flag
+            # alone isn't enough. Without this, models routinely re-call
+            # filter_rows with a larger limit trying to "see more", which
+            # (a) hits the same 50-row cap and (b) burns tool-loop
+            # iterations. Telling them to switch to aggregate() closes
+            # that failure mode at the source.
+            result["guidance"] = (
+                f"This response was truncated to {limit} rows (of "
+                f"{matched} total matching). If you need a total, a trend "
+                f"over time, or a per-group breakdown, DO NOT call "
+                f"filter_rows again with a larger limit (the cap is 50). "
+                f"Instead call aggregate() with the appropriate group_by "
+                f"column and agg_func='count' or 'sum'."
+            )
+        return result
+    
     except Exception as e:
         return {"error": str(e)}
 
@@ -274,7 +307,14 @@ _AGG_MAX_GROUPS = 50
 
 
 def aggregate(df: pd.DataFrame, group_by: str, agg_column: str, agg_func: str) -> dict:
-    """Group by one column, aggregate another. Results capped at 50 groups."""
+    """
+    Group by one column, aggregate another. Results capped at 50 groups.
+
+    When agg_func == 'count', each result also includes a 'share' field —
+    the percentage of the total count, rounded to 2 decimals. Share is
+    deliberately omitted for other agg funcs: percentages of a mean or a
+    median aren't meaningful.
+    """
     try:
         if group_by not in df.columns:
             return _column_error(df, group_by, role="group_by column")
@@ -295,10 +335,21 @@ def aggregate(df: pd.DataFrame, group_by: str, agg_column: str, agg_func: str) -
             pass
 
         truncated = len(grouped) > _AGG_MAX_GROUPS
-        results = [
-            {"group": _to_jsonable(g), "value": _to_jsonable(v)}
-            for g, v in grouped.head(_AGG_MAX_GROUPS).items()
-        ]
+
+        include_share = agg_func == "count"
+        total = grouped.sum() if include_share else None
+
+        results = []
+        for g, v in grouped.head(_AGG_MAX_GROUPS).items():
+            entry = {"group": _to_jsonable(g), "value": _to_jsonable(v)}
+            if include_share:
+                try:
+                    entry["share"] = (
+                        round(float(v) / float(total) * 100, 2) if total else 0.0
+                    )
+                except (TypeError, ValueError, ZeroDivisionError):
+                    entry["share"] = 0.0
+            results.append(entry)
 
         return {
             "group_by": str(group_by),
@@ -383,7 +434,8 @@ TOOL_SCHEMAS: list[dict] = [
             "description": (
                 "Frequency counts for one column. Top N values (max 50, "
                 "default 10). Sets truncated: true when there were more "
-                "distinct values than returned."
+                "distinct values than returned. Each value includes a share "
+                "field (percentage of non-null rows)."
             ),
             "parameters": {
                 "type": "object",
@@ -400,9 +452,11 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "filter_rows",
             "description": (
-                "Return rows matching a single comparison. Results capped at "
-                "50 (default 20) and truncated: true is set when the cap was "
-                "hit — tell the user and offer to narrow the query."
+                "Return rows matching a single comparison. Results are "
+                "capped at 50 (default 20). Do NOT use this to compute "
+                "totals, trends, or per-group counts — use aggregate() for "
+                "those. When the response includes truncated: true, the "
+                "result was capped; increasing the limit will not help."
             ),
             "parameters": {
                 "type": "object",
@@ -427,9 +481,12 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "aggregate",
             "description": (
-                "Group the data by one column and aggregate another. Results "
-                "capped at 50 groups. Use this for 'highest/lowest/most' "
-                "questions and any grouped totals."
+                "Group the data by one column and aggregate another. This is "
+                "the tool to use for totals, trends over time, per-category "
+                "sums, and any 'how many' question with a 'by X' or 'over "
+                "time' flavor. Results capped at 50 groups. When agg_func "
+                "is 'count', each result includes a share field (percentage "
+                "of the total count)."
             ),
             "parameters": {
                 "type": "object",
