@@ -1,15 +1,22 @@
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from app.routers import upload, datasets, reports, catalog
 from db.database import init_db
 
-app = FastAPI(title="AI Data Processing Platform",
-              description="A platform for uploading datasets, processing them with AI, and generating reports.",
-              version="0.1.0")
 
-@app.on_event("startup")
-def on_startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     init_db()
+    yield
+
+
+app = FastAPI(
+    title="JimmyCore",
+    description="A RAG + tool-calling analyst over Malaysian government open data and uploaded CSVs.",
+    version="0.2.0",
+    lifespan=lifespan,
+)
 
 # Include routers
 app.include_router(upload.router, prefix="/upload", tags=["Upload"])

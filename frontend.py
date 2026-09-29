@@ -1,9 +1,13 @@
-import streamlit as st
-import requests
 import json
+import os
 
-API_BASE = "http://localhost:8000"
-# API_BASE = "https://jimmycore-production.up.railway.app"
+import requests
+import streamlit as st
+
+# Read from env so deployment doesn't require editing this file. Falls
+# back to the local dev URL — running `streamlit run frontend.py` with
+# no env var set behaves exactly as before.
+API_BASE = os.getenv("JIMMYCORE_API_URL", "http://localhost:8000")
 
 st.set_page_config(
     page_title="JimmyCore",
@@ -399,7 +403,8 @@ if st.session_state.profile_result:
     if st.session_state.source_kind == "government":
         st.caption("Official government dataset")
     elif st.session_state.source_kind == "upload":
-        st.caption(f"Uploaded file: {st.session_state.source_label}")
+        # Filename is already the page title above — don't repeat it here.
+        st.caption("Uploaded CSV file")
 
     # ── Overview ────────────────────────────────────────────────────────
     st.markdown("### Overview")

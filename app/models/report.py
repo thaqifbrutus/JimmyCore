@@ -7,17 +7,16 @@ from db.database import Base
 
 class QualityReport(Base):
     """
-    A report is an analysis of some tabular data — it doesn't matter
-    whether that data came from a user's uploaded CSV or a dataset found
-    via a government-catalog search. Both flows share this one table
-    rather than duplicating get_report / technical-context / ask logic
-    across two near-identical tables.
+    An analysis session over some tabular data. Both flows — uploaded CSV
+    and government-catalog dataset — share this one table so get_report,
+    ask, and every downstream /reports/{id} endpoint work identically
+    regardless of where the data came from.
 
     Exactly one of dataset_id / catalog_dataset_id is set per row, never
-    both, never neither — enforced at the database level (not just trusted
-    to application code) via the CheckConstraint below. Postgres supports
-    `!=` on two boolean expressions as XOR, so this reads as "exactly one
-    of these two IS NOT NULL checks is true."
+    both, never neither — enforced at the database level via the
+    CheckConstraint below. Postgres supports `!=` on two boolean
+    expressions as XOR, so this reads as "exactly one of these two IS NOT
+    NULL checks is true."
     """
     __tablename__ = "quality_reports"
     __table_args__ = (

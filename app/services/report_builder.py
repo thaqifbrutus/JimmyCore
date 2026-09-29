@@ -18,9 +18,11 @@ def persist_report(
     """
     Creates and commits a QualityReport plus its AuditLog entry.
 
-    Note: this revamp stopped writing overall_status — the "quality
-    verdict" concept is gone. The column stays for now (see Future work
-    in tool_runner.py); SQLAlchemy applies the model default ("pending").
+    Exactly one of dataset_id / catalog_dataset_id should be passed,
+    matching the ck_report_exactly_one_source constraint. The
+    overall_status column is left at its default — the "quality verdict"
+    concept was dropped when the app moved to a chat-based analyst model;
+    the column stays for schema compatibility.
     """
     report = QualityReport(
         dataset_id=dataset_id,

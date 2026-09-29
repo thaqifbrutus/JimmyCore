@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 uploads/
 file_uploads/
+scripts/generate_deepseek_context.py
+DEEPSEEK_PROJECT_CONTEXT.md

@@ -229,6 +229,11 @@ def _get_issues(df: pd.DataFrame) -> list:
 
 
 def determine_overall_status(issues: list) -> str:
+    """
+    Retained for backward compatibility with tests; not called by the
+    application anymore. Kept as a pure function so the test suite
+    continues to exercise the severity-ranking logic.
+    """
     severities = [i["severity"] for i in issues]
     if "critical" in severities:
         return "critical"

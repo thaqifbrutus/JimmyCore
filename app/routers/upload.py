@@ -1,6 +1,5 @@
 import os
 import uuid
-import shutil
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from sqlalchemy.orm import Session
 from db.database import get_db
@@ -11,7 +10,7 @@ router = APIRouter()
 
 UPLOAD_DIR = "file_uploads"
 ALLOWED_TYPES = ["text/csv", "application/vnd.ms-excel"]
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB, in bytes — the size comparison below depends on this unit
 
 # FastAPI endpoint for uploading datasets via UploadFile, File and Depends
 @router.post("")
@@ -26,7 +25,10 @@ async def upload_dataset(file: UploadFile = File(...), db: Session = Depends(get
     size_mb = len(contents) / (1024 * 1024)
 
     if size_mb > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail=f"File too large: {size_mb:.1f}MB. Maximum allowed size is {MAX_FILE_SIZE}MB.")
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large: {size_mb:.1f}MB. Maximum allowed size is {MAX_FILE_SIZE // (1024 * 1024)}MB.",
+        )
     
     # Generate a unique filename to avoid collisions
     unique_filename = f"{uuid.uuid4()}_{file.filename}"
