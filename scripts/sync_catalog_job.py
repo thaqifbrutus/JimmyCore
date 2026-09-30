@@ -1,46 +1,37 @@
 """
 Standalone script for keeping the catalog index fresh — syncs the
-official dataset list, then embeds any new/updated rows. Designed to run
-as its OWN Railway service (separate from the FastAPI web service),
-configured with Railway's native Cron Schedule (Settings > Cron Schedule
-on that service) rather than as an HTTP call to /catalog/sync.
+official dataset list, then embeds any new/updated rows.
 
-Why a separate service instead of calling the existing endpoint:
-- Railway cron services run a start command and are expected to EXIT when
-  done — this script does exactly that (see the exit code at the bottom),
-  whereas the FastAPI web service is meant to stay running. They're
-  different service shapes, so they're different Railway services within
-  the same project.
+Designed to run as its own short-lived process rather than as an HTTP
+call to /catalog/sync:
+
 - This script imports sync_catalog/generate_catalog_embeddings directly
-  and opens its own short-lived DB session, rather than making an HTTP
-  request to the running web service. One fewer network hop, and it still
-  works correctly even if the web service happens to be redeploying at
-  the moment the cron fires.
-- Both services share the same DATABASE_URL and OPENROUTER_API_KEY env
-  vars (set them on this service too, same values as the web service).
+  and opens its own DB session, rather than making an HTTP request to a
+  running web service. One fewer network hop, and it works correctly even
+  if the web service happens to be redeploying at the moment the job runs.
 
-Railway setup (done in the dashboard, not in code):
-1. In your Railway project, create a new service from the same repo.
-2. Set its start command to: python scripts/sync_catalog_job.py
-3. Settings > Cron Schedule: e.g. "0 2 * * *" (02:00 UTC daily) — the
-   data.gov.my catalog itself updates roughly daily, so there's no benefit
-   to syncing more often than that.
-4. Copy DATABASE_URL and OPENROUTER_API_KEY from the web service's
-   variables (or reference them, if your Railway plan supports shared
-   variables) — this script needs both.
+- The GitHub Actions workflow in .github/workflows/sync-catalog.yml
+  invokes it daily at 02:00 UTC via `python scripts/sync_catalog_job.py`.
 
-Note per Railway's own docs: cron jobs that exit non-zero are NOT
-automatically retried. A missed daily sync isn't a big deal for a
-search index — it just means the catalog is up to a day stale until the
-next scheduled run — so this deliberately does not implement its own
-retry logic. If you want alerting on failures, that's a separate,
-optional concern (Railway's dashboard shows failed runs either way).
+- Requires DATABASE_URL and OPENROUTER_API_KEY in the environment.
+  Locally that's .env; in CI they come from repository secrets.
+
+Note: a failed run is not retried. A missed daily sync isn't a big deal
+for a search index — it just means the catalog is up to a day stale until
+the next scheduled run — so this deliberately does not implement its own
+retry logic. Failures are visible in the Actions tab.
 """
 import sys
+from pathlib import Path
 
-from db.database import SessionLocal
-from app.services.catalog_sync import sync_catalog
-from app.services.catalog_search import generate_catalog_embeddings
+# Ensure the repo root is on sys.path so `python scripts/sync_catalog_job.py`
+# can import `db` and `app` — without this, only scripts/ is on the path,
+# and direct invocation fails with ModuleNotFoundError.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from db.database import SessionLocal  # noqa: E402
+from app.services.catalog_sync import sync_catalog  # noqa: E402
+from app.services.catalog_search import generate_catalog_embeddings  # noqa: E402
 
 
 def run() -> int:
