@@ -81,3 +81,78 @@ uvicorn app.main:app --reload
 
 # Frontend (in a second terminal)
 streamlit run frontend.py
+```
+
+The first search will return zero results — the catalog table starts empty.
+Seed it once:
+
+```bash
+python scripts/sync_catalog_job.py
+```
+
+That same script also runs daily via `.github/workflows/sync-catalog.yml`.
+
+### Deployment notes
+
+Backend runs on Render's free tier, database on Neon's free tier.
+
+Neon suspends compute after a few minutes of idle time and closes its
+connections; Render kills idle TCP connections too. The SQLAlchemy engine in
+`db/database.py` is configured with `pool_pre_ping`, `pool_recycle`, and TCP
+keepalives to survive both — without those, a stale pooled connection produces
+`SSL connection has been closed unexpectedly` on the next request. Neon's
+pooled connection string (`-pooler` in the hostname) also requires stripping
+`channel_binding=require`, since PgBouncer in transaction mode doesn't support
+it.
+
+An [UptimeRobot](https://uptimerobot.com) ping keeps the Render instance from
+spinning down after its 15-minute idle window.
+
+## Testing
+
+```bash
+pytest -q
+```
+
+`110 passed, 5 skipped` as of the last commit.
+
+The five skipped tests in `tests/test_catalog_analyze.py` are integration
+tests for the `/catalog/{id}/analyze` endpoint. They require a Postgres
+instance and a shared `client` fixture that hasn't been built yet; they're
+kept on disk as a specification of the endpoint's expected behaviour. The
+rest of the suite runs against in-memory SQLite and mocked network calls.
+
+## Limitations
+
+- **Tabular only.** JimmyCore handles CSV and JSON-array data. It doesn't
+  ingest PDFs, Word documents, or web pages yet — that's the next major
+  feature.
+- **5000-row fetch cap.** The government API has no pagination. When a dataset
+  exceeds the cap, JimmyCore tells the model its view may be partial, and the
+  model tells you.
+- **Free-tier AI quota.** The default OpenRouter model chain uses free
+  models. If the daily budget runs out, JimmyCore surfaces a clear
+  "quota exhausted, back after the daily reset" message rather than a raw
+  error.
+- **No chat persistence.** Conversations live in Streamlit session state.
+  Reload the tab, lose the thread.
+- **Cold-start latency.** The backend runs on Render's free tier, which
+  spins down after 15 minutes idle. The UptimeRobot ping usually keeps it
+  warm, but the very first request after a long quiet period may take ~20s.
+- **National-aggregate rows.** Some government datasets mix a "Malaysia"
+  total row with per-state rows. The overview chart currently treats them the
+  same, so a national total can dominate the visualization.
+
+## Roadmap
+
+- **Document ingestion** — the next major feature. PDFs and text from
+  ministry sites, chunked and embedded alongside the tabular catalog.
+- **Chat persistence** — a `chat_messages` table so sessions survive reloads.
+- **Agentic multi-dataset queries** — "compare drug arrests to road
+  accidents."
+- **Better handling of national-aggregate rows** — filter them out of charts
+  by default, or split into national/state views.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
