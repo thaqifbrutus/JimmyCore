@@ -7,7 +7,7 @@ import streamlit as st
 # Read from env so deployment doesn't require editing this file. Falls
 # back to the local dev URL — running `streamlit run frontend.py` with
 # no env var set behaves exactly as before.
-API_BASE = os.getenv("JIMMYCORE_API_URL", "http://localhost:8000")
+API_BASE = os.getenv("JIMMYCORE_API_URL", "http://localhost:8000").rstrip("/")
 
 st.set_page_config(
     page_title="JimmyCore",
