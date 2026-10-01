@@ -8,8 +8,14 @@ fly, not recalled from the model's memory — and visualizes what it finds.
 
 **[Try it live →](https://jimmycore.streamlit.app)** · [API](https://jimmycore-api.onrender.com)
 
-> Screenshot: the chat view showing "What the data *can* tell you" / "What the
-> data *cannot* tell you" — insert the Kelantan opiate cases screenshot here.
+> Screenshot: 
+<img width="1919" height="993" alt="image" src="https://github.com/user-attachments/assets/f7e33907-7c11-4449-828e-211b028d4359" />
+
+<img width="1919" height="915" alt="image" src="https://github.com/user-attachments/assets/29ab6ff0-ef79-4f65-928e-11aee6006ac9" />
+
+<img width="1919" height="991" alt="image" src="https://github.com/user-attachments/assets/03983b60-34f2-46e1-9c3c-755be4eb74e5" />
+
+<img width="1919" height="909" alt="image" src="https://github.com/user-attachments/assets/78a55115-7bef-4408-88de-90e3b3c57619" />
 
 ---
 
@@ -30,54 +36,11 @@ queries the underlying dataset.
   `get_schema`) that it calls against the real DataFrame, so answers come from
   computed results rather than the model's memory.
 - **Visualize** — when a question is best answered with a breakdown or a
-  trend, the chat renders a chart below the response. No extra clicks.
-- **Stick to the data** — when the answer isn't in the dataset, Jimmy says so,
-  cites the source agency, and stops. See the sample exchange below.
-
-## A sample exchange
-
-> **You:** Why did Kelantan suddenly have a massive drop in opiate cases from
-> 2020 to 2023?
->
-> **Jimmy:** The data shows a gradual decline from 2020–2022, then a slight
-> uptick in 2023 — not a sudden drop. Here are the exact figures:
->
-> | Year | Kelantan Opiate Cases |
-> |------|----------------------|
-> | 2019 | 158 |
-> | 2020 | 157 |
-> | 2021 | 56 |
-> | 2022 | 37 |
-> | 2023 | 77 |
->
-> …
->
-> ### What the data *cannot* tell you
->
-> The dataset contains only counts by state, year, and drug type. It has no
-> fields for:
->
-> - Enforcement operations, policy changes, or treatment capacity
-> - Demographics, socioeconomic factors, or reporting practices
-> - Data collection methodology changes
->
-> Any causal explanation (policy, enforcement, reporting changes, pandemic
-> effects, etc.) would require external information not present in this
-> dataset.
->
-> *Source: AADK, KDN (Official Government Dataset, Public Safety → Drug
-> Addiction, 2015–2023).*
-
-The refusal to invent a cause is the part I care most about. A general-purpose
-LLM will happily produce a plausible-sounding explanation. JimmyCore points
-you at the source when a real decision is on the line.
-
-> Screenshot: the chat view showing the tool-call trail button and the
-> per-year bar chart — insert the Johor/Kedah/Kelantan table screenshot here.
+  trend, the chat renders a chart below the response.
 
 ## How it works
 
-Three services, one flow.
+Three services:
 
 1. A **catalog sync** job pulls the official dataset list
    ([data.gov.my's parquet dump](https://storage.data.gov.my/metrics/dataset_list.parquet))
@@ -118,3 +81,78 @@ uvicorn app.main:app --reload
 
 # Frontend (in a second terminal)
 streamlit run frontend.py
+```
+
+The first search will return zero results — the catalog table starts empty.
+Seed it once:
+
+```bash
+python scripts/sync_catalog_job.py
+```
+
+That same script also runs daily via `.github/workflows/sync-catalog.yml`.
+
+### Deployment notes
+
+Backend runs on Render's free tier, database on Neon's free tier.
+
+Neon suspends compute after a few minutes of idle time and closes its
+connections; Render kills idle TCP connections too. The SQLAlchemy engine in
+`db/database.py` is configured with `pool_pre_ping`, `pool_recycle`, and TCP
+keepalives to survive both — without those, a stale pooled connection produces
+`SSL connection has been closed unexpectedly` on the next request. Neon's
+pooled connection string (`-pooler` in the hostname) also requires stripping
+`channel_binding=require`, since PgBouncer in transaction mode doesn't support
+it.
+
+An [UptimeRobot](https://uptimerobot.com) ping keeps the Render instance from
+spinning down after its 15-minute idle window.
+
+## Testing
+
+```bash
+pytest -q
+```
+
+`110 passed, 5 skipped` as of the last commit.
+
+The five skipped tests in `tests/test_catalog_analyze.py` are integration
+tests for the `/catalog/{id}/analyze` endpoint. They require a Postgres
+instance and a shared `client` fixture that hasn't been built yet; they're
+kept on disk as a specification of the endpoint's expected behaviour. The
+rest of the suite runs against in-memory SQLite and mocked network calls.
+
+## Limitations
+
+- **Tabular only.** JimmyCore handles CSV and JSON-array data. It doesn't
+  ingest PDFs, Word documents, or web pages yet — that's the next major
+  feature.
+- **5000-row fetch cap.** The government API has no pagination. When a dataset
+  exceeds the cap, JimmyCore tells the model its view may be partial, and the
+  model tells you.
+- **Free-tier AI quota.** The default OpenRouter model chain uses free
+  models. If the daily budget runs out, JimmyCore surfaces a clear
+  "quota exhausted, back after the daily reset" message rather than a raw
+  error.
+- **No chat persistence.** Conversations live in Streamlit session state.
+  Reload the tab, lose the thread.
+- **Cold-start latency.** The backend runs on Render's free tier, which
+  spins down after 15 minutes idle. The UptimeRobot ping usually keeps it
+  warm, but the very first request after a long quiet period may take ~20s.
+- **National-aggregate rows.** Some government datasets mix a "Malaysia"
+  total row with per-state rows. The overview chart currently treats them the
+  same, so a national total can dominate the visualization.
+
+## Roadmap
+
+- **Document ingestion** — the next major feature. PDFs and text from
+  ministry sites, chunked and embedded alongside the tabular catalog.
+- **Chat persistence** — a `chat_messages` table so sessions survive reloads.
+- **Agentic multi-dataset queries** — "compare drug arrests to road
+  accidents."
+- **Better handling of national-aggregate rows** — filter them out of charts
+  by default, or split into national/state views.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
