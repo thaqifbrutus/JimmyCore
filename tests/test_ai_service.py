@@ -1,16 +1,20 @@
 """
-Tests for the daily-quota short-circuit in ai_service._call_ai_model.
+Tests for app/services/ai_service.py — the daily-quota short-circuit,
+history trimming in answer_dataset_question, and the language instruction
+in SYSTEM_PROMPT.
 
-Only the OpenRouter call is mocked. The point of these tests is the
-control-flow contract: when OpenRouter reports the account-wide free-tier
-daily budget is exhausted, the model chain must stop after one attempt
-(no fallback can help — they all share the budget); for any other error,
-the chain walks as before.
+Network is never touched: the model call is mocked at whichever boundary
+is appropriate for each test.
 """
+import pandas as pd
 import pytest
 
 from app.services import ai_service
 
+
+# ---------------------------------------------------------------------------
+# Daily-quota short-circuit
+# ---------------------------------------------------------------------------
 
 def test_daily_quota_error_aborts_model_chain(monkeypatch):
     call_count = {"n": 0}
@@ -78,3 +82,97 @@ def test_quota_error_detection_helper(monkeypatch):
     # Free-tier markers without a 429 — not a daily-quota error.
     assert not ai_service._is_daily_quota_error(RuntimeError("free-models-per-day"))
     assert not ai_service._is_daily_quota_error(RuntimeError("network error"))
+
+
+# ---------------------------------------------------------------------------
+# History trimming (Task 3)
+# ---------------------------------------------------------------------------
+
+def test_answer_dataset_question_trims_history(monkeypatch):
+    """
+    answer_dataset_question's job is to build the message list and hand
+    it to tool_runner.run_tool_loop. We mock that boundary and inspect
+    what it received — the tool loop itself has its own tests.
+
+    With 20 turns of history and MAX_HISTORY_TURNS=12, the model should
+    only see the last 12 turns (i.e. messages from turn 8 onward).
+    """
+    from app.services import tool_runner
+
+    captured = {}
+
+    def fake_run_tool_loop(df, messages, system_prompt, context_label, max_tokens=4000):
+        captured["messages"] = messages
+        return {
+            "status": "ok",
+            "content": "answer",
+            "reason": None,
+            "tool_calls_log": [],
+        }
+
+    monkeypatch.setattr(tool_runner, "run_tool_loop", fake_run_tool_loop)
+
+    # 20 turns = 40 messages, alternating user/assistant.
+    history = []
+    for i in range(20):
+        history.append({"role": "user", "content": f"Q{i}"})
+        history.append({"role": "assistant", "content": f"A{i}"})
+
+    ai_service.answer_dataset_question(
+        df=pd.DataFrame({"x": [1, 2, 3]}),
+        profile_data={"overview": {}},
+        original_filename="test.csv",
+        question="final?",
+        conversation_history=history,
+    )
+
+    msgs = captured["messages"]
+    # [context_user, context_assistant] + last 24 history entries + final question.
+    assert len(msgs) == 2 + (ai_service.MAX_HISTORY_TURNS * 2) + 1
+
+    # The trimmed history should start at turn 8 (20 - 12) and end at turn 19.
+    history_slice = msgs[2:-1]
+    assert history_slice[0]["content"] == "Q8"
+    assert history_slice[-1]["content"] == "A19"
+    # And the final question is still last.
+    assert msgs[-1]["content"] == "final?"
+
+
+def test_answer_dataset_question_handles_short_history(monkeypatch):
+    """Under the cap, nothing gets dropped."""
+    from app.services import tool_runner
+
+    captured = {}
+
+    def fake_run_tool_loop(df, messages, system_prompt, context_label, max_tokens=4000):
+        captured["messages"] = messages
+        return {"status": "ok", "content": "x", "reason": None, "tool_calls_log": []}
+
+    monkeypatch.setattr(tool_runner, "run_tool_loop", fake_run_tool_loop)
+
+    history = [
+        {"role": "user", "content": "Q0"},
+        {"role": "assistant", "content": "A0"},
+    ]
+
+    ai_service.answer_dataset_question(
+        df=pd.DataFrame({"x": [1]}),
+        profile_data={},
+        original_filename="test.csv",
+        question="next?",
+        conversation_history=history,
+    )
+
+    msgs = captured["messages"]
+    # 2 context + 2 history + 1 question = 5
+    assert len(msgs) == 5
+    assert msgs[2]["content"] == "Q0"
+    assert msgs[3]["content"] == "A0"
+
+
+# ---------------------------------------------------------------------------
+# Language instruction (Task 4)
+# ---------------------------------------------------------------------------
+
+def test_system_prompt_instructs_same_language():
+    assert "respond in the same language" in ai_service.SYSTEM_PROMPT

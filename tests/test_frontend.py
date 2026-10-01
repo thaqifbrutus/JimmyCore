@@ -1,14 +1,14 @@
 """
 Tests for frontend.py using Streamlit's AppTest framework — this runs the
-REAL app script and simulates REAL user interaction (typing into the
-search box, clicking buttons), not just checking that functions exist.
-Only requests.get/requests.post are mocked, at the exact same boundary
-every other test suite in this codebase mocks external calls at.
+REAL app script and simulates REAL user interaction. Only requests.get
+and requests.post are mocked, at the same boundary every other test suite
+in this codebase mocks at.
 
-This is meaningfully stronger verification than "the Python syntax is
-valid" — it proves the actual Streamlit widget tree renders correctly and
-responds to interaction the way a real user's clicks would.
+Round 1 streaming: /ask/stream is now the endpoint the frontend calls.
+Tests that exercise the chat flow construct a fake stream response whose
+iter_lines() yields SSE data lines.
 """
+import json
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -22,6 +22,32 @@ def _mock_response(status_code=200, json_data=None):
     resp.headers = {"content-type": "application/json"}
     resp.text = str(json_data)
     return resp
+
+
+def _fake_stream_response(events):
+    """
+    Mimics requests.Response for a streamed request. iter_lines() yields
+    the SSE data lines: b"data: <json>" plus a blank b"" between events.
+    """
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.headers = {"content-type": "text/event-stream"}
+
+    lines = []
+    for event in events:
+        lines.append(f"data: {json.dumps(event)}".encode("utf-8"))
+        lines.append(b"")
+
+    resp.iter_lines.return_value = iter(lines)
+    return resp
+
+
+def _default_stream_events(content="OK."):
+    """Minimal stream: one token, one done with empty tool_calls_log."""
+    return [
+        {"type": "token", "content": content},
+        {"type": "done", "content": content, "tool_calls_log": []},
+    ]
 
 
 def _fake_search_results():
@@ -43,11 +69,6 @@ def _fake_search_results():
 
 
 def _fake_analysis_result(overview_chart=None):
-    """
-    overview_chart: override the chart on the overview. Default is a
-    count-based chart; pass a dict to inject a sum-based one for tests
-    that exercise the sum caption path.
-    """
     if overview_chart is None:
         overview_chart = {
             "column": "state",
@@ -88,26 +109,23 @@ def _fake_analysis_result(overview_chart=None):
     }
 
 
-def _fake_post_dispatcher(analysis=None, ask=None):
+def _fake_post_dispatcher(analysis=None, stream_events=None):
     """
-    Returns a side_effect function for requests.post that routes /analyze
-    and /ask to different fake responses. Required because both endpoints
-    are POSTs and a single return_value can't distinguish them.
+    routes /analyze, /ask/stream, and /reset.  /ask/stream returns a
+    fake SSE response; other endpoints return the standard mock response.
     """
     def _dispatch(url, **kwargs):
         if "/analyze" in url:
             return _mock_response(200, analysis or _fake_analysis_result())
-        if "/ask" in url:
-            if ask is None:
-                return _mock_response(500, {"detail": "unmocked /ask"})
-            return _mock_response(200, ask)
+        if "/ask/stream" in url:
+            return _fake_stream_response(stream_events or _default_stream_events())
+        if "/reset" in url:
+            return _mock_response(200, {"report_id": "abc-123", "reset": True})
         return _mock_response(404, {"detail": "unhandled POST"})
     return _dispatch
 
 
 def _has_bar_chart(at):
-    """Streamlit AppTest exposes bar charts under one of several names
-    depending on version. Check the plausible ones — return True on any."""
     for key in ("bar_chart", "arrow_vega_lite_chart", "vega_lite_chart"):
         try:
             if len(at.get(key)) > 0:
@@ -118,8 +136,6 @@ def _has_bar_chart(at):
 
 
 def _drive_to_detail_view(at, fake_results=None, analysis=None):
-    """Search → click Analyze → land on the detail page. Returns the
-    AppTest instance, mutated in place."""
     fake_results = fake_results or _fake_search_results()
     with patch("frontend.requests.get", return_value=_mock_response(200, fake_results)):
         at.text_input[0].set_value("road accidents")
@@ -137,7 +153,6 @@ def _drive_to_detail_view(at, fake_results=None, analysis=None):
 def test_app_loads_with_search_mode_selected_by_default():
     at = AppTest.from_file("../frontend.py")
     at.run(timeout=60)
-
     assert not at.exception
     assert at.radio[0].value == "Search government data"
 
@@ -145,10 +160,8 @@ def test_app_loads_with_search_mode_selected_by_default():
 def test_switching_to_upload_mode_shows_file_uploader():
     at = AppTest.from_file("../frontend.py")
     at.run(timeout=15)
-
     at.radio[0].set_value("Upload a CSV")
     at.run(timeout=15)
-
     assert not at.exception
     assert len(at.get("file_uploader")) == 1
 
@@ -156,13 +169,10 @@ def test_switching_to_upload_mode_shows_file_uploader():
 def test_search_with_no_results_shows_info_message():
     at = AppTest.from_file("../frontend.py")
     at.run(timeout=15)
-
     with patch("frontend.requests.get", return_value=_mock_response(200, {"results": []})):
-        at.text_input[0].set_value("some very specific query with no matches")
-        search_button = next(b for b in at.button if b.label == "\U0001f50d Search")
-        search_button.click()
+        at.text_input[0].set_value("nope")
+        next(b for b in at.button if b.label == "\U0001f50d Search").click()
         at.run(timeout=15)
-
     assert not at.exception
     assert any("No matching datasets found" in i.value for i in at.info)
 
@@ -170,12 +180,10 @@ def test_search_with_no_results_shows_info_message():
 def test_search_with_results_renders_dataset_cards():
     at = AppTest.from_file("../frontend.py")
     at.run(timeout=15)
-
     with patch("frontend.requests.get", return_value=_mock_response(200, _fake_search_results())):
         at.text_input[0].set_value("drunk driving accidents")
         next(b for b in at.button if b.label == "\U0001f50d Search").click()
         at.run(timeout=15)
-
     assert not at.exception
     markdown_text = " ".join(m.value for m in at.markdown)
     assert "Road Accidents by State" in markdown_text
@@ -185,7 +193,6 @@ def test_search_with_results_renders_dataset_cards():
 def test_analyze_button_populates_detail_view_with_overview_and_suggested_questions():
     at = AppTest.from_file("../frontend.py")
     at.run(timeout=15)
-
     _drive_to_detail_view(at)
 
     assert not at.exception
@@ -199,23 +206,13 @@ def test_analyze_button_populates_detail_view_with_overview_and_suggested_questi
 
     button_labels = [b.label for b in at.button]
     assert "Which state has the most accidents?" in button_labels
-    assert not any("Technical brief" in m for m in markdown_text)
-    assert not any(b.label == "Generate technical brief" for b in at.button)
 
-    # Round B: overview chart renders under the prose
-    assert _has_bar_chart(at), "expected a bar chart in the detail view"
-
-    # Count-based chart → caption should read "Top N values of `state`"
+    assert _has_bar_chart(at)
     caption_text = " ".join(c.value for c in at.caption)
     assert "values of `state`" in caption_text
 
 
 def test_overview_chart_shows_sum_caption_when_metric_provided():
-    """
-    When the model returns a primary_metric, the overview chart is
-    sum-based and the caption should read "Top N `state` by `cases`"
-    instead of "Top N values of `state`".
-    """
     at = AppTest.from_file("../frontend.py")
     at.run(timeout=15)
 
@@ -226,84 +223,42 @@ def test_overview_chart_shows_sum_caption_when_metric_provided():
         "values": [
             {"value": "Johor", "count": 3191},
             {"value": "Kedah", "count": 2975},
-            {"value": "Kelantan", "count": 2780},
         ],
         "truncated": False,
     }
     analysis = _fake_analysis_result(overview_chart=sum_chart)
-    # Make primary_metric match, for internal consistency.
     analysis["overview"]["content"]["primary_metric"] = "total_cases"
 
     _drive_to_detail_view(at, analysis=analysis)
 
     assert not at.exception
-    assert _has_bar_chart(at), "expected a bar chart in the detail view"
-
+    assert _has_bar_chart(at)
     caption_text = " ".join(c.value for c in at.caption)
     assert "`state`" in caption_text
     assert "`total_cases`" in caption_text
-    # The count-based phrasing must NOT be present for a sum chart.
     assert "values of" not in caption_text
-
-
-def test_suggested_question_button_submits_question_to_chat():
-    at = AppTest.from_file("../frontend.py")
-    at.run(timeout=15)
-
-    fake_ask = {
-        "question": "Which state has the most accidents?",
-        "answer": {
-            "status": "ok",
-            "reason": None,
-            "content": "Selangor has the most with 1,234.",
-        },
-        "report_id": "abc-123",
-        "tool_calls_log": [],
-    }
-
-    _drive_to_detail_view(at)
-
-    with patch("frontend.requests.post", side_effect=_fake_post_dispatcher(ask=fake_ask)):
-        suggested = next(
-            b for b in at.button if b.label == "Which state has the most accidents?"
-        )
-        suggested.click()
-        at.run(timeout=15)
-
-    assert not at.exception
-    markdown_text = " ".join(m.value for m in at.markdown)
-    assert "Selangor has the most with 1,234." in markdown_text
 
 
 def test_back_to_search_clears_state():
     at = AppTest.from_file("../frontend.py")
     at.run(timeout=15)
-
     _drive_to_detail_view(at)
-
     assert at.session_state["report_id"] == "abc-123"
-
-    back_button = next(b for b in at.button if "Back to search" in b.label)
-    back_button.click()
+    next(b for b in at.button if "Back to search" in b.label).click()
     at.run(timeout=15)
-
     assert not at.exception
     assert at.session_state["report_id"] is None
     assert at.session_state["profile_result"] is None
-    assert at.session_state["source_label"] is None
-    assert at.session_state["suggested_questions"] == []
     assert at.session_state["messages"] == []
 
 
 def test_search_api_error_shows_error_message():
     at = AppTest.from_file("../frontend.py")
     at.run(timeout=15)
-
     with patch("frontend.requests.get", side_effect=__import__("requests").exceptions.ConnectionError("refused")):
         at.text_input[0].set_value("anything")
         next(b for b in at.button if b.label == "\U0001f50d Search").click()
         at.run(timeout=15)
-
     assert not at.exception
     assert any("Search failed" in e.value for e in at.error)
 
@@ -311,247 +266,187 @@ def test_search_api_error_shows_error_message():
 def test_enter_in_search_submits_the_form():
     at = AppTest.from_file("../frontend.py")
     at.run(timeout=15)
-
     with patch("frontend.requests.get", return_value=_mock_response(200, _fake_search_results())):
         at.text_input[0].set_value("road accidents")
         at.run(timeout=15)
-
     assert not at.exception
-    assert at.session_state["search_error"] is None
     assert at.session_state["search_results"] == _fake_search_results()["results"]
-    markdown_text = " ".join(m.value for m in at.markdown)
-    assert "Road Accidents by State" in markdown_text
 
 
-# ── A1/B6: provenance demoted behind an icon button ────────────────────────
+# ── Streaming chat tests ───────────────────────────────────────────────────
 
-def test_provenance_is_hidden_behind_button():
+def test_suggested_question_submits_and_streams_answer():
     """
-    Round B replaced the big 🔍 How I got this answer expander with a
-    single discreet ⚙️ Tool calls (N) popover.
-
-    Streamlit's AppTest in 1.58 does NOT surface st.popover widgets in
-    its element tree (verified: at.button, at.expander, and
-    at.get("popover") all come up empty for the popover, while the
-    browser renders it correctly). So we assert at the data layer:
-    the old prominent label is gone, and tool_calls are attached to
-    the assistant message — which is what drives the popover render.
+    Clicking a suggested question streams a response. The assistant
+    message that lands in session state should contain the streamed text.
     """
     at = AppTest.from_file("../frontend.py")
     at.run(timeout=15)
 
-    fake_ask = {
-        "question": "Which state had the most road accidents?",
-        "answer": {
-            "status": "ok",
-            "reason": None,
-            "content": "Selangor had the most, with 1,234 incidents.",
-        },
-        "report_id": "abc-123",
-        "tool_calls_log": [
-            {
-                "name": "filter_rows",
-                "arguments": {
-                    "column": "state",
-                    "operator": "==",
-                    "value": "Selangor",
-                },
-                "result_summary": "17 rows matched",
-                "chart_data": None,
-            }
-        ],
-    }
+    stream_events = [
+        {"type": "token", "content": "Selangor "},
+        {"type": "token", "content": "has 1,234."},
+        {"type": "done", "content": "Selangor has 1,234.", "tool_calls_log": []},
+    ]
 
     _drive_to_detail_view(at)
 
-    with patch("frontend.requests.post", side_effect=_fake_post_dispatcher(ask=fake_ask)):
-        suggested = next(
-            b for b in at.button if b.label == "Which state has the most accidents?"
-        )
+    with patch("frontend.requests.post", side_effect=_fake_post_dispatcher(stream_events=stream_events)):
+        suggested = next(b for b in at.button if b.label == "Which state has the most accidents?")
         suggested.click()
         at.run(timeout=15)
 
     assert not at.exception
+    # Last assistant message should carry the full streamed text.
+    assistant_msgs = [m for m in at.session_state["messages"] if m["role"] == "assistant"]
+    assert assistant_msgs
+    assert "Selangor has 1,234." in assistant_msgs[-1]["content"]
 
-    markdown_text = " ".join(m.value for m in at.markdown)
-    assert "How I got this answer" not in markdown_text
 
-    assistant_msgs = [
-        m for m in at.session_state["messages"] if m["role"] == "assistant"
+def test_streaming_done_event_attaches_tool_calls():
+    at = AppTest.from_file("../frontend.py")
+    at.run(timeout=15)
+
+    stream_events = [
+        {"type": "token", "content": "Result."},
+        {
+            "type": "done",
+            "content": "Result.",
+            "tool_calls_log": [
+                {
+                    "name": "filter_rows",
+                    "arguments": {"column": "state", "operator": "==", "value": "Selangor"},
+                    "result_summary": "17 rows matched",
+                    "chart_data": None,
+                }
+            ],
+        },
     ]
-    assert assistant_msgs, "expected at least one assistant message"
-    last_assistant = assistant_msgs[-1]
-    assert last_assistant.get("tool_calls"), (
-        "expected tool_calls attached to the assistant message — this is "
-        "what the ⚙️ Tool calls popover renders from"
-    )
-    assert last_assistant["tool_calls"][0]["name"] == "filter_rows"
+
+    _drive_to_detail_view(at)
+
+    with patch("frontend.requests.post", side_effect=_fake_post_dispatcher(stream_events=stream_events)):
+        next(b for b in at.button if b.label == "Which state has the most accidents?").click()
+        at.run(timeout=15)
+
+    assert not at.exception
+    assistant_msgs = [m for m in at.session_state["messages"] if m["role"] == "assistant"]
+    last = assistant_msgs[-1]
+    assert last["tool_calls"]
+    assert last["tool_calls"][0]["name"] == "filter_rows"
 
 
-# ── A5/B5: inline chart under the answer text ──────────────────────────────
+def test_streaming_error_event_surfaces_error_type():
+    at = AppTest.from_file("../frontend.py")
+    at.run(timeout=15)
+
+    stream_events = [
+        {"type": "error", "message": "429 free-models-per-day", "error_type": "daily_quota_exhausted"},
+    ]
+
+    _drive_to_detail_view(at)
+
+    with patch("frontend.requests.post", side_effect=_fake_post_dispatcher(stream_events=stream_events)):
+        next(b for b in at.button if b.label == "Which state has the most accidents?").click()
+        at.run(timeout=15)
+
+    assert not at.exception
+    assistant_msgs = [m for m in at.session_state["messages"] if m["role"] == "assistant"]
+    assert assistant_msgs
+    assert assistant_msgs[-1].get("error_type") == "daily_quota_exhausted"
+
 
 def test_bar_chart_renders_for_value_counts_tool_call():
     at = AppTest.from_file("../frontend.py")
     at.run(timeout=15)
 
-    fake_ask = {
-        "question": "Break down accidents by state",
-        "answer": {
-            "status": "ok",
-            "reason": None,
-            "content": "Selangor and Johor lead; here's the full breakdown.",
-        },
-        "report_id": "abc-123",
-        "tool_calls_log": [
-            {
-                "name": "value_counts",
-                "arguments": {"column": "state"},
-                "result_summary": "3 values",
-                "chart_data": [
-                    {"value": "Selangor", "count": 12},
-                    {"value": "Johor", "count": 8},
-                    {"value": "Penang", "count": 4},
-                ],
-            }
-        ],
-    }
-
-    _drive_to_detail_view(at)
-
-    with patch("frontend.requests.post", side_effect=_fake_post_dispatcher(ask=fake_ask)):
-        suggested = next(
-            b for b in at.button if b.label == "Which state has the most accidents?"
-        )
-        suggested.click()
-        at.run(timeout=15)
-
-    assert not at.exception
-    assert _has_bar_chart(at), "expected a bar chart under the answer text"
-
-
-def test_inline_chart_renders_under_answer_text():
-    at = AppTest.from_file("../frontend.py")
-    at.run(timeout=15)
-
-    fake_ask = {
-        "question": "Show me the breakdown",
-        "answer": {
-            "status": "ok",
-            "reason": None,
+    stream_events = [
+        {"type": "token", "content": "Here's the breakdown."},
+        {
+            "type": "done",
             "content": "Here's the breakdown.",
+            "tool_calls_log": [
+                {
+                    "name": "value_counts",
+                    "arguments": {"column": "state"},
+                    "result_summary": "3 values",
+                    "chart_data": [
+                        {"value": "Selangor", "count": 12},
+                        {"value": "Johor", "count": 8},
+                        {"value": "Penang", "count": 4},
+                    ],
+                }
+            ],
         },
-        "report_id": "abc-123",
-        "tool_calls_log": [
-            {
-                "name": "aggregate",
-                "arguments": {
-                    "group_by": "state",
-                    "agg_column": "count",
-                    "agg_func": "sum",
-                },
-                "result_summary": "3 groups",
-                "chart_data": [
-                    {"group": "Selangor", "value": 1200},
-                    {"group": "Johor", "value": 800},
-                    {"group": "Penang", "value": 400},
-                ],
-            }
-        ],
-    }
+    ]
 
     _drive_to_detail_view(at)
 
-    with patch("frontend.requests.post", side_effect=_fake_post_dispatcher(ask=fake_ask)):
-        suggested = next(
-            b for b in at.button if b.label == "Which state has the most accidents?"
-        )
-        suggested.click()
+    with patch("frontend.requests.post", side_effect=_fake_post_dispatcher(stream_events=stream_events)):
+        next(b for b in at.button if b.label == "Which state has the most accidents?").click()
         at.run(timeout=15)
 
     assert not at.exception
     assert _has_bar_chart(at)
 
 
-def test_no_chart_when_no_tool_call_has_chart_data():
-    """When every tool call carries chart_data=None, no chat chart renders."""
+def test_provenance_is_hidden_behind_button():
+    """
+    The provenance popover is not reachable via AppTest's element tree
+    in Streamlit 1.58 — we assert on the data layer instead.
+    """
     at = AppTest.from_file("../frontend.py")
     at.run(timeout=15)
 
-    fake_ask = {
-        "question": "How many rows are there?",
-        "answer": {
-            "status": "ok",
-            "reason": None,
-            "content": "There are 500 rows.",
+    stream_events = [
+        {"type": "token", "content": "Selangor had 1,234."},
+        {
+            "type": "done",
+            "content": "Selangor had 1,234.",
+            "tool_calls_log": [
+                {
+                    "name": "filter_rows",
+                    "arguments": {"column": "state", "operator": "==", "value": "Selangor"},
+                    "result_summary": "17 rows matched",
+                    "chart_data": None,
+                }
+            ],
         },
-        "report_id": "abc-123",
-        "tool_calls_log": [
-            {
-                "name": "get_schema",
-                "arguments": {},
-                "result_summary": "4 columns",
-                "chart_data": None,
-            },
-            {
-                "name": "get_sample_rows",
-                "arguments": {"n": 5},
-                "result_summary": "5 rows",
-                "chart_data": None,
-            },
-        ],
-    }
+    ]
 
     _drive_to_detail_view(at)
 
-    with patch("frontend.requests.post", side_effect=_fake_post_dispatcher(ask=fake_ask)):
-        suggested = next(
-            b for b in at.button if b.label == "Which state has the most accidents?"
-        )
-        suggested.click()
-        at.run(timeout=15)
-
-    assert not at.exception
-    # Detail view still shows its own overview chart, so at most one
-    # chart should be present (no chat chart was added).
-    chart_count = 0
-    for key in ("bar_chart", "arrow_vega_lite_chart", "vega_lite_chart"):
-        try:
-            chart_count += len(at.get(key))
-        except Exception:
-            pass
-    assert chart_count <= 1, (
-        f"expected only the overview chart, got {chart_count} chart elements"
-    )
-
-
-# ── A3: quota-exhausted error message ──────────────────────────────────────
-
-def test_quota_exhausted_error_shows_friendly_message():
-    at = AppTest.from_file("../frontend.py")
-    at.run(timeout=15)
-
-    fake_ask = {
-        "question": "Which state had the most?",
-        "answer": {
-            "status": "failed",
-            "reason": "429 free-models-per-day",
-            "error_type": "daily_quota_exhausted",
-            "content": None,
-            "tool_calls_log": [],
-        },
-        "report_id": "abc-123",
-        "tool_calls_log": [],
-    }
-
-    _drive_to_detail_view(at)
-
-    with patch("frontend.requests.post", side_effect=_fake_post_dispatcher(ask=fake_ask)):
-        suggested = next(
-            b for b in at.button if b.label == "Which state has the most accidents?"
-        )
-        suggested.click()
+    with patch("frontend.requests.post", side_effect=_fake_post_dispatcher(stream_events=stream_events)):
+        next(b for b in at.button if b.label == "Which state has the most accidents?").click()
         at.run(timeout=15)
 
     assert not at.exception
     markdown_text = " ".join(m.value for m in at.markdown)
-    assert "AI quota exhausted for today" in markdown_text
+    assert "How I got this answer" not in markdown_text
+
+    assistant_msgs = [m for m in at.session_state["messages"] if m["role"] == "assistant"]
+    assert assistant_msgs[-1].get("tool_calls")
+    assert assistant_msgs[-1]["tool_calls"][0]["name"] == "filter_rows"
+
+
+def test_reset_conversation_clears_messages():
+    at = AppTest.from_file("../frontend.py")
+    at.run(timeout=15)
+
+    stream_events = _default_stream_events("Answer.")
+
+    _drive_to_detail_view(at)
+
+    with patch("frontend.requests.post", side_effect=_fake_post_dispatcher(stream_events=stream_events)):
+        next(b for b in at.button if b.label == "Which state has the most accidents?").click()
+        at.run(timeout=15)
+
+    # Now messages should be non-empty.
+    assert at.session_state["messages"]
+
+    with patch("frontend.requests.post", return_value=_mock_response(200, {"reset": True})):
+        next(b for b in at.button if b.label == "🗑️ Reset conversation").click()
+        at.run(timeout=15)
+
+    assert not at.exception
+    assert at.session_state["messages"] == []

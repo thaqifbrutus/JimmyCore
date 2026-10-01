@@ -40,3 +40,9 @@ class QualityReport(Base):
     ai_summary = Column(Text, nullable=True)
     overall_status = Column(String, default="pending")
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Persisted chat history for this session. Shape: list of dicts, each
+    # with keys {"role", "content", "tool_calls"|None, "error_type"|None,
+    # "timestamp"}. Nullable — pre-migration rows have NULL, treated as
+    # an empty list by the API layer.
+    chat_messages = Column(JSONB, nullable=True)

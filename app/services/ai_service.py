@@ -16,6 +16,11 @@ _OPENROUTER_HEADERS = {
     "X-Title": OPENROUTER_APP_NAME,
 }
 
+# Cap on how many turns of history to send to the model. Each "turn"
+# is one user + one assistant message. Older turns are dropped — the
+# chat stays coherent for typical use, and context stays bounded.
+MAX_HISTORY_TURNS = 12
+
 SYSTEM_PROMPT = """
 
 You are JimmyCore AI, a data analyst embedded in a platform for exploring
@@ -55,6 +60,12 @@ When a tool errors:
 When you cannot answer: if the data doesn't contain what's needed, say
 so plainly. Do not fabricate. Offer what you can answer.
 
+Language: respond in the same language the user writes in. If they write in
+Bahasa Malaysia, respond in Bahasa Malaysia. If they write in English,
+respond in English. Never translate column names, source agency names, or
+dataset titles — always show those in their original form (usually English)
+so the user can match them against the actual data.
+
 Tone: professional, conversational, precise. Write for mixed audiences —
 developers, analysts, project managers. Avoid jargon where possible.
 
@@ -63,19 +74,14 @@ developers, analysts, project managers. Avoid jargon where possible.
 
 # ---------------------------------------------------------------------------
 # Source context — the "source" field mentioned in SYSTEM_PROMPT above.
-# Pure function, no I/O, so it's directly unit-testable without a database
-# or an API call: given a catalog dataset's fields, build the dict that
-# gets embedded into profile_data before it's sent to the model.
 # ---------------------------------------------------------------------------
 
 def build_source_context(catalog_dataset) -> dict:
     """
     Builds the "source" dict injected into profile_data for a
-    catalog-sourced report, so the model can cite it per SYSTEM_PROMPT's
-    instructions above. Takes any object with the relevant attributes
+    catalog-sourced report. Takes any object with the relevant attributes
     (a real CatalogDataset row, or a stand-in in tests) rather than
-    importing the model directly — keeps this module decoupled from the
-    DB layer, same as everything else in ai_service.py.
+    importing the model directly.
     """
     coverage = None
     if catalog_dataset.dataset_begin and catalog_dataset.dataset_end:
@@ -132,14 +138,7 @@ def _is_structured_output_unsupported_error(exc: Exception) -> bool:
 def _is_daily_quota_error(exc: Exception) -> bool:
     """
     True when OpenRouter reports the account-wide free-tier daily limit is
-    exhausted. This is a per-ACCOUNT budget shared by every free model, so
-    when it fires, no fallback model has any chance of succeeding — the
-    only correct response is to stop walking the chain and surface the
-    error to the user.
-
-    Matched by inspecting the error text because OpenRouter surfaces this
-    as a 429 with a limit_source field; there's no dedicated exception
-    class from the OpenAI SDK for it.
+    exhausted. Per-ACCOUNT budget shared by every free model.
     """
     text = str(exc).lower()
     return (
@@ -179,9 +178,6 @@ def _call_ai_model(
             response = client.chat.completions.create(**kwargs)
 
         except Exception as exc:
-            # Daily quota exhaustion is account-wide: no fallback can help.
-            # Break immediately instead of walking the chain (~15s of
-            # guaranteed-fail calls + per-model log noise).
             if _is_daily_quota_error(exc):
                 print(
                     "WARNING: OpenRouter daily quota exhausted — "
@@ -286,8 +282,6 @@ def _success_result(content) -> dict:
 # ---------------------------------------------------------------------------
 # Dataset overview — produces a short orientation, suggested questions,
 # and a hint (primary_column + primary_metric) about what to chart.
-# Structured output via json_schema, with the same unsupported-model
-# fallback path the old technical-context generator had.
 # ---------------------------------------------------------------------------
 
 _DATASET_OVERVIEW_RESPONSE_FORMAT = {
@@ -439,26 +433,24 @@ def generate_dataset_overview(profile_data: dict, original_filename: str) -> dic
 
 
 # ---------------------------------------------------------------------------
-# Q&A — tool-driven. Delegates the loop to tool_runner, which owns the
-# model chain, iteration cap, and context-mode fallback.
+# Q&A — tool-driven. Delegates the loop to tool_runner.
 # ---------------------------------------------------------------------------
 
-def answer_dataset_question(
-    df,
+def _build_qa_messages(
     profile_data: dict,
     original_filename: str,
     question: str,
-    conversation_history: list = None,
-) -> dict:
+    conversation_history: list | None = None,
+) -> list[dict]:
     """
-    Delegates to tool_runner.run_tool_loop. Returns
-    {"status", "content", "reason", "error_type", "tool_calls_log"}.
+    Builds the message list handed to tool_runner for a chat turn. Shared
+    between the non-streaming and streaming Q&A paths so prompt shape
+    stays in one place.
 
-    Local import of tool_runner to avoid a module-level import cycle
-    (tool_runner imports from this module).
+    conversation_history is the persisted chat_messages list from the
+    report — entries carry extra fields (tool_calls, error_type,
+    timestamp) that we ignore here; we only need role and content.
     """
-    from app.services import tool_runner
-
     context_message = f"""
 The user is asking questions about a dataset called "{original_filename}".
 Here is a profile of the data for context:
@@ -478,14 +470,64 @@ answering. Prefer computing over recalling.
     ]
 
     if conversation_history:
-        for turn in conversation_history:
+        # Each turn is 2 messages (user + assistant). Cap total turns to
+        # MAX_HISTORY_TURNS so a long session doesn't blow the context window.
+        trimmed = conversation_history[-(MAX_HISTORY_TURNS * 2):]
+        for turn in trimmed:
             messages.append({"role": turn["role"], "content": turn["content"]})
 
     messages.append({"role": "user", "content": question})
+    return messages
+
+
+def answer_dataset_question(
+    df,
+    profile_data: dict,
+    original_filename: str,
+    question: str,
+    conversation_history: list = None,
+) -> dict:
+    """
+    Non-streaming Q&A. Delegates to tool_runner.run_tool_loop. Returns
+    {"status", "content", "reason", "error_type", "tool_calls_log"}.
+    """
+    from app.services import tool_runner
+
+    messages = _build_qa_messages(
+        profile_data, original_filename, question, conversation_history
+    )
 
     return tool_runner.run_tool_loop(
         df=df,
         messages=messages,
         system_prompt=SYSTEM_PROMPT,
         context_label=f"qa:{original_filename}",
+    )
+
+
+def answer_dataset_question_streaming(
+    df,
+    profile_data: dict,
+    original_filename: str,
+    question: str,
+    conversation_history: list = None,
+):
+    """
+    Streaming Q&A. Returns a generator that yields the events documented
+    on tool_runner.run_tool_loop_streaming:
+      {"type": "token", "content": "..."}
+      {"type": "done", "content": "...", "tool_calls_log": [...]}
+      {"type": "error", "message": "...", "error_type": "..."}
+    """
+    from app.services import tool_runner
+
+    messages = _build_qa_messages(
+        profile_data, original_filename, question, conversation_history
+    )
+
+    return tool_runner.run_tool_loop_streaming(
+        df=df,
+        messages=messages,
+        system_prompt=SYSTEM_PROMPT,
+        context_label=f"qa-stream:{original_filename}",
     )

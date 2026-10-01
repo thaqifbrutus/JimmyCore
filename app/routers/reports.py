@@ -1,11 +1,13 @@
 from fastapi import APIRouter, HTTPException, Depends
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
+import datetime
 import os
 import json
 
 import pandas as pd
 
-from db.database import get_db
+from db.database import get_db, SessionLocal
 from app.models.dataset import Dataset
 from app.models.report import QualityReport
 from app.models.catalog_dataset import CatalogDataset
@@ -16,13 +18,16 @@ from app.services.report_builder import persist_report
 from app.services.ai_service import (
     generate_dataset_overview,
     answer_dataset_question,
+    answer_dataset_question_streaming,
 )
 from pydantic import BaseModel
 
 
 class QuestionRequest(BaseModel):
+    # conversation_history used to be a client-supplied field. It's now
+    # server-managed (persisted on report.chat_messages), so we don't
+    # accept it anymore.
     question: str
-    conversation_history: list = []
 
 
 router = APIRouter()
@@ -31,13 +36,7 @@ UPLOAD_DIR = "file_uploads"
 
 
 def _resolve_source_name(dataset: Dataset | None, catalog_dataset: CatalogDataset | None) -> str:
-    """
-    A report's "original filename" for AI-prompt purposes now has two
-    possible sources — an uploaded file's original_name, or a government
-    catalog dataset's title_en — since QualityReport is shared across both
-    flows. Pure function, no DB access, so it's directly unit-testable
-    without a database at all.
-    """
+    """A report's "original filename" for AI-prompt purposes."""
     if dataset is not None:
         return dataset.original_name
     if catalog_dataset is not None:
@@ -50,11 +49,7 @@ def _resolve_source_name(dataset: Dataset | None, catalog_dataset: CatalogDatase
 
 
 def _get_report_source(report: QualityReport, db: Session) -> tuple[Dataset | None, CatalogDataset | None]:
-    """
-    Looks up whichever source this report actually has, based on which of
-    dataset_id / catalog_dataset_id is set. Exactly one will be, per the
-    DB-level CHECK constraint.
-    """
+    """Looks up whichever source this report actually has."""
     dataset = None
     catalog_dataset = None
 
@@ -90,10 +85,6 @@ def trigger_profile(
             original_filename=dataset.original_name,
         )
 
-        # Attach a chart to the overview, matching the catalog flow's
-        # response shape. Chart is presentation — if the file can't be
-        # re-read for charting, the overview just ships without a chart
-        # rather than failing the whole profile request.
         if overview.get("status") == "ok" and isinstance(overview.get("content"), dict):
             try:
                 chart_df = pd.read_csv(file_path)
@@ -110,10 +101,6 @@ def trigger_profile(
         dataset.row_count = profile["overview"]["row_count"]
         dataset.column_count = profile["overview"]["column_count"]
         dataset.status = "complete"
-        # Deliberately not committed here — persist_report's first commit
-        # (when it creates the report) flushes these dataset changes too,
-        # matching the original code's atomicity: dataset status and its
-        # report are committed together, not as two separate transactions.
 
         report = persist_report(
             db, profile, overview,
@@ -158,12 +145,28 @@ def get_report(report_id: str, db: Session = Depends(get_db)):
         except (json.JSONDecodeError, TypeError):
             ai_summary = {"status": "ok", "reason": None, "content": ai_summary}
 
+    source_title = None
+    if report.catalog_dataset_id:
+        cd = (
+            db.query(CatalogDataset)
+            .filter(CatalogDataset.id == report.catalog_dataset_id)
+            .first()
+        )
+        if cd:
+            source_title = cd.title_en
+    elif report.dataset_id:
+        d = db.query(Dataset).filter(Dataset.id == report.dataset_id).first()
+        if d:
+            source_title = d.original_name
+
     return {
         "id": str(report.id),
         "dataset_id": str(report.dataset_id) if report.dataset_id else None,
         "catalog_dataset_id": report.catalog_dataset_id,
         "profile_data": report.profile_data,
         "ai_summary": ai_summary,
+        "chat_messages": report.chat_messages or [],
+        "source_title": source_title,
         "created_at": report.created_at.isoformat()
     }
 
@@ -186,13 +189,33 @@ def ask_about_dataset(
     except data_loader.DataLoadError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
+    prior_messages = list(report.chat_messages or [])
+
     answer = answer_dataset_question(
         df=df,
         profile_data=report.profile_data,
         original_filename=original_filename,
         question=request.question,
-        conversation_history=request.conversation_history,
+        conversation_history=prior_messages,
     )
+
+    now = datetime.datetime.utcnow().isoformat()
+    prior_messages.append({
+        "role": "user",
+        "content": request.question,
+        "tool_calls": None,
+        "error_type": None,
+        "timestamp": now,
+    })
+    prior_messages.append({
+        "role": "assistant",
+        "content": answer.get("content"),
+        "tool_calls": answer.get("tool_calls_log", []),
+        "error_type": answer.get("error_type"),
+        "timestamp": now,
+    })
+    report.chat_messages = prior_messages
+    db.commit()
 
     return {
         "question": request.question,
@@ -200,3 +223,116 @@ def ask_about_dataset(
         "report_id": report_id,
         "tool_calls_log": answer.get("tool_calls_log", []),
     }
+
+
+@router.post("/{report_id}/ask/stream")
+def ask_about_dataset_streaming(
+    report_id: str,
+    request: QuestionRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Streaming variant of /ask. Returns text/event-stream; each SSE data
+    line is a JSON-encoded event of the shape documented on
+    tool_runner.run_tool_loop_streaming.
+
+    The chat turn is persisted once the generator finishes, using a
+    FRESH DB session — the request-scoped `db` is closed by the time
+    StreamingResponse runs the generator, so calling db.commit() here
+    would fail. See the persist block inside event_stream.
+    """
+    report = db.query(QualityReport).filter(QualityReport.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    dataset, catalog_dataset = _get_report_source(report, db)
+    original_filename = _resolve_source_name(dataset, catalog_dataset)
+
+    try:
+        df = data_loader.load_dataframe_for_report(report, db)
+    except data_loader.DataLoadError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    prior_messages = list(report.chat_messages or [])
+
+    def event_stream():
+        full_text = ""
+        tool_calls_log: list = []
+        error_type = None
+
+        try:
+            for event in answer_dataset_question_streaming(
+                df=df,
+                profile_data=report.profile_data,
+                original_filename=original_filename,
+                question=request.question,
+                conversation_history=prior_messages,
+            ):
+                if event["type"] == "token":
+                    full_text += event.get("content", "")
+                elif event["type"] == "done":
+                    tool_calls_log = event.get("tool_calls_log", []) or []
+                    # The done event carries the full content — prefer it
+                    # in case stream assembly dropped a final fragment.
+                    done_content = event.get("content")
+                    if done_content and not full_text:
+                        full_text = done_content
+                elif event["type"] == "error":
+                    error_type = event.get("error_type")
+
+                yield f"data: {json.dumps(event, default=str)}\n\n"
+        except Exception as e:
+            error_event = {"type": "error", "message": str(e), "error_type": None}
+            yield f"data: {json.dumps(error_event)}\n\n"
+            error_type = None
+        finally:
+            # Persist using a FRESH session. The request-scoped `db` was
+            # closed by the get_db dependency by the time this generator
+            # runs — SQLAlchemy would raise if we tried to use it here.
+            #
+            # This lives in `finally` so we still write what we have if
+            # the client disconnects mid-stream (GeneratorExit skips the
+            # normal post-loop code path otherwise).
+            persist_db = SessionLocal()
+            try:
+                fresh_report = (
+                    persist_db.query(QualityReport)
+                    .filter(QualityReport.id == report_id)
+                    .first()
+                )
+                if fresh_report is not None:
+                    now = datetime.datetime.utcnow().isoformat()
+                    msgs = list(fresh_report.chat_messages or [])
+                    msgs.append({
+                        "role": "user",
+                        "content": request.question,
+                        "tool_calls": None,
+                        "error_type": None,
+                        "timestamp": now,
+                    })
+                    msgs.append({
+                        "role": "assistant",
+                        "content": full_text,
+                        "tool_calls": tool_calls_log,
+                        "error_type": error_type,
+                        "timestamp": now,
+                    })
+                    fresh_report.chat_messages = msgs
+                    persist_db.commit()
+            except Exception as e:
+                print(f"WARNING: failed to persist streaming chat turn: {e}")
+            finally:
+                persist_db.close()
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.post("/{report_id}/reset")
+def reset_conversation(report_id: str, db: Session = Depends(get_db)):
+    """Clears the chat history for a report."""
+    report = db.query(QualityReport).filter(QualityReport.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+    report.chat_messages = []
+    db.commit()
+    return {"report_id": report_id, "reset": True}
