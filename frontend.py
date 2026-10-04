@@ -4,8 +4,10 @@ import os
 import requests
 import streamlit as st
 
+# Read from env so deployment doesn't require editing this file. Falls
+# back to the local dev URL — running `streamlit run frontend.py` with
+# no env var set behaves exactly as before.
 API_BASE = os.getenv("JIMMYCORE_API_URL", "http://localhost:8000")
-APP_URL_BASE = os.getenv("JIMMYCORE_APP_URL", "http://localhost:8501")
 
 st.set_page_config(
     page_title="JimmyCore",
@@ -18,7 +20,41 @@ st.caption("Search official government datasets, or upload your own CSV — ask 
 st.divider()
 
 
-# ── API helpers ────────────────────────────────────────────────────────────
+# ── App URL resolution ────────────────────────────────────────────────────
+# Used by the share-link affordance in the detail view. Resolved at module
+# load time — the Host header doesn't change within a session, so caching
+# the value in APP_URL_BASE is fine.
+
+def _resolve_app_url() -> str:
+    """
+    Figure out the public URL the app is being served from.
+
+    Priority:
+      1. JIMMYCORE_APP_URL env var — explicit override for custom domains
+         or cases where header detection is wrong.
+      2. The Host header from st.context — works on Streamlit Cloud
+         without any configuration.
+      3. localhost fallback for local dev when neither is available.
+    """
+    override = os.getenv("JIMMYCORE_APP_URL")
+    if override:
+        return override.rstrip("/")
+
+    try:
+        host = st.context.headers.get("Host")
+        if host:
+            scheme = "https" if "streamlit.app" in host or "onrender.com" in host else "http"
+            return f"{scheme}://{host}"
+    except Exception:
+        pass
+
+    return "http://localhost:8501"
+
+
+APP_URL_BASE = _resolve_app_url()
+
+
+# ── API helpers — upload flow ──────────────────────────────────────────────
 
 def upload_file(file):
     response = requests.post(
@@ -33,7 +69,15 @@ def trigger_profile(dataset_id):
     return response.json() if response.status_code == 200 else None
 
 
+# ── API helpers — government catalog search flow ───────────────────────────
+
 def search_catalog(query, top_k=5):
+    """
+    Returns (results, error_message) — one is always None. Distinguishing
+    a genuine search failure from "search worked, zero matches" so the UI
+    can show the right message for each rather than treating both as
+    silent nothing.
+    """
     try:
         response = requests.get(
             f"{API_BASE}/catalog/search",
@@ -65,6 +109,8 @@ def analyze_catalog_dataset(catalog_dataset_id, force_refresh=False):
 
 
 def load_report(report_id):
+    """Fetches a full report (including saved chat) by id. Used by the
+    URL-driven session loader for shared links."""
     try:
         response = requests.get(f"{API_BASE}/reports/{report_id}", timeout=30)
     except requests.exceptions.RequestException:
@@ -86,9 +132,14 @@ _QUOTA_EXHAUSTED_MESSAGE = (
 
 
 def extract_ai_content(result_dict, field_name="content"):
+    """
+    Pulls .content out of a structured AI result dict.
+    Returns (content, error_message) — one is always None.
+    """
     if result_dict is None:
         return None, "No response received from the API."
     if isinstance(result_dict, str):
+        # Old-shape response from an endpoint not yet updated — pass through.
         return result_dict, None
     if result_dict.get("error_type") == "daily_quota_exhausted":
         return None, _QUOTA_EXHAUSTED_MESSAGE
@@ -102,6 +153,7 @@ def extract_ai_content(result_dict, field_name="content"):
 
 
 def render_failed_ai(label: str, reason: str):
+    """Consistent UI treatment for a failed AI result."""
     st.warning(
         f"⚠️ **{label} could not be generated.**\n\n"
         f"Reason: {reason}",
@@ -109,7 +161,16 @@ def render_failed_ai(label: str, reason: str):
     )
 
 
-def _render_chart(chart_data, x_label=None, y_label=None):
+def _render_chart(chart_data: list[dict] | None, x_label: str | None = None,
+                  y_label: str | None = None):
+    """
+    Render a small bar chart from a chart_data list of {key, value} dicts.
+
+    x_label / y_label are passed through to st.bar_chart so the axes are
+    labeled. The chart is a presentation bonus — a broken chart must not
+    break the page it renders on, so the whole thing is wrapped in
+    try/except and silently skipped on any failure.
+    """
     if not chart_data:
         return
     try:
@@ -119,10 +180,15 @@ def _render_chart(chart_data, x_label=None, y_label=None):
         )
         st.bar_chart(chart_df, x_label=x_label, y_label=y_label)
     except Exception:
-        pass
+        pass  # charts are a bonus; never break the page over one
 
 
-def _chart_axis_labels(tool_name, tool_args, chart_data):
+def _chart_axis_labels(tool_name: str | None, tool_args: dict | None,
+                       chart_data: list[dict] | None) -> tuple[str | None, str | None]:
+    """
+    Derive human-readable x/y axis labels from a chat tool call's name and
+    arguments.
+    """
     args = tool_args or {}
     if tool_name == "value_counts":
         return args.get("column"), "count"
@@ -140,7 +206,10 @@ def _chart_axis_labels(tool_name, tool_args, chart_data):
     return None, None
 
 
-def _render_tool_calls_button(tool_calls):
+def _render_tool_calls_button(tool_calls: list):
+    """
+    Renders the tool-call trail behind a single discreet icon button.
+    """
     if not tool_calls:
         return
     with st.popover(f"⚙️ Tool calls ({len(tool_calls)})"):
@@ -152,7 +221,137 @@ def _render_tool_calls_button(tool_calls):
             st.caption(call.get("result_summary", "—"))
 
 
+def _render_copy_link_button(url: str):
+    """
+    Renders a compact emoji-only button that copies `url` to the
+    clipboard on click, then briefly shows a checkmark.
+
+    Streamlit has no native copy-to-clipboard widget, so this uses a
+    small HTML/JS payload in an iframe. navigator.clipboard can be
+    blocked in some iframe contexts, so there's a legacy
+    execCommand('copy') fallback.
+
+    Rendered via st.iframe with a base64 data URI. Two details are
+    load-bearing:
+
+      - The data URI declares ;charset=utf-8 AND the HTML document has
+        <meta charset="utf-8"> as its first element. Without both, some
+        browsers decode the base64 payload as Latin-1 and the emoji
+        renders as mojibake (ðŸ"").
+      - The document is a FULL HTML document (<!DOCTYPE html>, <html>,
+        <head>, <body>) because data URIs are parsed standalone, not
+        wrapped like components.html's input.
+
+    If st.iframe isn't available or rejects the data URI, this falls
+    back to components.html, which still works (deprecated 2026-06-01).
+    """
+    import base64
+    import json as _json
+
+    html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body {{
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background: transparent;
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    height: 100%;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }}
+  #jc-copy-btn {{
+    width: 40px;
+    height: 40px;
+    padding: 0;
+    background: transparent;
+    color: inherit;
+    border: 1px solid rgba(128,128,128,0.4);
+    border-radius: 0.5rem;
+    cursor: pointer;
+    font-size: 1.25rem;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s, transform 0.1s;
+  }}
+  #jc-copy-btn:hover {{
+    background: rgba(128,128,128,0.12);
+  }}
+  #jc-copy-btn:active {{
+    transform: scale(0.94);
+  }}
+</style>
+</head>
+<body>
+<button id="jc-copy-btn" title="Copy share link" aria-label="Copy share link">&#x1F517;</button>
+<script>
+  (function() {{
+    const url = {_json.dumps(url)};
+    const btn = document.getElementById('jc-copy-btn');
+    btn.addEventListener('click', function() {{
+      function fallbackCopy() {{
+        const ta = document.createElement('textarea');
+        ta.value = url;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        try {{ document.execCommand('copy'); }} catch (e) {{}}
+        document.body.removeChild(ta);
+      }}
+      function showCopied() {{
+        btn.textContent = '\\u2713';
+        btn.style.color = '#22c55e';
+        setTimeout(function() {{
+          btn.textContent = '\\u{{1F517}}';
+          btn.style.color = 'inherit';
+        }}, 1500);
+      }}
+      if (navigator.clipboard && navigator.clipboard.writeText) {{
+        navigator.clipboard.writeText(url).then(showCopied).catch(function() {{
+          fallbackCopy();
+          showCopied();
+        }});
+      }} else {{
+        fallbackCopy();
+        showCopied();
+      }}
+    }});
+  }})();
+</script>
+</body>
+</html>"""
+
+    b64 = base64.b64encode(html_content.encode("utf-8")).decode("ascii")
+    # ;charset=utf-8 in the media type is the primary fix for the
+    # mojibake — it tells the browser the base64 payload decodes to
+    # UTF-8 bytes, not Latin-1.
+    data_uri = f"data:text/html;charset=utf-8;base64,{b64}"
+
+    # Try st.iframe first (the non-deprecated path). Fall back to
+    # components.html only if st.iframe is missing or rejects the URI.
+    try:
+        st.iframe(data_uri, height=48, scrolling=False)
+    except TypeError:
+        # Older st.iframe signature without scrolling= param.
+        try:
+            st.iframe(data_uri, height=48)
+        except Exception:
+            import streamlit.components.v1 as components
+            components.html(html_content, height=48)
+    except Exception:
+        import streamlit.components.v1 as components
+        components.html(html_content, height=48)
+
+
 def _build_markdown_export(profile_result, messages, source_label):
+    """Serialise the overview + conversation to a Markdown string."""
     lines = [f"# {source_label or 'JimmyCore session'}", ""]
     ov = (profile_result or {}).get("overview") or {}
     content = ov.get("content") if isinstance(ov, dict) else None
@@ -189,7 +388,7 @@ if "search_error" not in st.session_state:
 if "source_label" not in st.session_state:
     st.session_state.source_label = None
 if "source_kind" not in st.session_state:
-    st.session_state.source_kind = None
+    st.session_state.source_kind = None  # "government" | "upload" | None
 if "suggested_questions" not in st.session_state:
     st.session_state.suggested_questions = []
 if "chat_history" not in st.session_state:
@@ -203,6 +402,9 @@ if "_last_stream_metadata" not in st.session_state:
 
 
 # ── URL-driven session loading ────────────────────────────────────────────
+# If the URL has ?report=<uuid> and we haven't already loaded a session in
+# this browser context, fetch the report (with its saved chat) from the
+# backend. This is what makes shared links work.
 
 _url_report_id = st.query_params.get("report")
 if _url_report_id and st.session_state.profile_result is None:
@@ -229,6 +431,7 @@ if _url_report_id and st.session_state.profile_result is None:
 
 
 def _queue_search():
+    """Callback that fires when the user presses Enter in the search box."""
     st.session_state._search_triggered = True
 
 
@@ -242,6 +445,8 @@ def _reset_all():
     st.session_state.chat_history = []
     st.session_state.messages = []
     st.session_state._last_stream_metadata = None
+    # Also clear ?report=<uuid> from the URL so a "back to search" doesn't
+    # leave a stale share link in the address bar.
     try:
         st.query_params.clear()
     except Exception:
@@ -451,22 +656,23 @@ st.divider()
 if st.session_state.profile_result:
     result = st.session_state.profile_result
 
-    share_col, back_col, _spacer = st.columns([3, 1, 4])
-    with share_col:
-        st.code(
-            f"{APP_URL_BASE}?report={st.session_state.report_id}",
-            language=None,
-        )
+    # Layout: back-to-search on the left (where the copy button used to
+    # be), copy-link icon button on the far right edge. Middle column is
+    # an empty spacer.
+    back_col, _spacer, copy_col = st.columns([2, 6, 1])
     with back_col:
         if st.button("← Back to search", use_container_width=True):
             _reset_all()
             st.rerun()
+    with copy_col:
+        _render_copy_link_button(f"{APP_URL_BASE}?report={st.session_state.report_id}")
 
     title = st.session_state.source_label or "Dataset"
     st.title(title)
     if st.session_state.source_kind == "government":
         st.caption("Official government dataset")
     elif st.session_state.source_kind == "upload":
+        # Filename is already the page title above — don't repeat it here.
         st.caption("Uploaded CSV file")
 
     # ── Overview ────────────────────────────────────────────────────────
